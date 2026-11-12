@@ -138,3 +138,7 @@ phases reuse them: Chrome holds a new WebSocket handshake to the same endpoint f
 it are saturated with uploads, which left ramp workers idle and restarted the test on the 10 s handshake timeout.
 Upload progress counts bytes that have left the WebSocket: bytes handed to `ws.send` minus `ws.bufferedAmount`,
 sending only while the stream's Wisp CONTINUE window allows and `bufferedAmount` is under a few MiB.
+
+## License
+
+ISC. See `LICENSE`.

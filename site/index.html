@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>wisp.baby: internet speed test over Wisp</title>
+  <meta name="description" content="How fast is your connection through Wisp? A speed test that runs entirely over the Wisp protocol.">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body data-mode="gcore" data-state="idle">
+  <a class="skip" href="#main">Skip to the result</a>
+
+  <header class="top">
+    <a class="wordmark" href="./" aria-label="wisp.baby home"><span>wisp<span class="wordmark-tld">.baby</span></span></a>
+  </header>
+
+  <main id="main" class="main">
+    <section class="result" aria-labelledby="speed-label">
+      <p id="speed-label" class="speed-label">Your Internet speed is</p>
+
+      <div class="speed-row" id="speed-row">
+        <div class="speed" id="speed" aria-live="polite" aria-atomic="true" aria-busy="true">
+          <span class="speed-value" id="speed-value">0</span>
+          <span class="speed-units" id="speed-units">Mbps</span>
+        </div>
+        <div class="speed-side">
+          <span class="spinner" id="spinner" aria-hidden="true"></span>
+          <button type="button" class="restart" id="restart" hidden aria-label="Run the test again">
+            <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true" focusable="false">
+              <path d="M20 12a8 8 0 1 1-2.34-5.66" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              <path d="M20.5 3.5v4.75h-4.75" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="error" id="error" role="alert" hidden>
+        <p class="error-msg" id="error-msg">Something went wrong.</p>
+        <button type="button" class="btn" id="retry">Try again</button>
+      </div>
+    </section>
+
+    <section class="modes" aria-label="Test servers">
+      <div class="switch" role="radiogroup" aria-label="Where the test servers are" id="switch">
+        <span class="switch-thumb" aria-hidden="true"></span>
+        <button type="button" class="switch-opt" role="radio" data-mode="gcore" id="opt-gcore" aria-checked="true">
+          <span class="switch-name">G-Core</span><span class="switch-sub">self-hosted</span>
+        </button>
+        <button type="button" class="switch-opt" role="radio" data-mode="netflix" id="opt-netflix" aria-checked="false" tabindex="-1">
+          <span class="switch-name">Netflix</span><span class="switch-sub">proxied</span>
+        </button>
+      </div>
+
+      <figure class="route" id="route">
+        <ol class="route-path" aria-label="Path the test traffic takes">
+          <li class="node node-you"><span class="node-dot" aria-hidden="true"></span><span class="node-label">You</span></li>
+          <li class="link" aria-hidden="true"><span class="link-line"></span></li>
+          <li class="node node-wisp"><span class="node-dot" aria-hidden="true"></span><span class="node-label">Wisp</span></li>
+          <li class="link" aria-hidden="true"><span class="link-line"></span></li>
+          <li class="node node-box"><span class="node-dot" aria-hidden="true"></span><span class="node-label" id="route-box">wisp.baby</span></li>
+          <li class="link link-oca" aria-hidden="true"><span class="link-line"></span></li>
+          <li class="node node-oca"><span class="node-dot" aria-hidden="true"></span><span class="node-label">Netflix Open Connect</span></li>
+        </ol>
+        <figcaption class="route-caption" id="route-caption">The wisp box is the test server</figcaption>
+      </figure>
+    </section>
+
+    <div class="more-toggle">
+      <button type="button" class="linkish" id="more-btn" aria-expanded="false" aria-controls="more">Show more info</button>
+    </div>
+
+    <section class="more" id="more" hidden aria-label="More info">
+      <div class="metrics">
+        <div class="metric">
+          <h2 class="metric-title">Latency</h2>
+          <div class="metric-pair">
+            <div class="metric-cell" id="lat-unloaded-cell" data-measuring="true">
+              <span class="metric-num"><span id="lat-unloaded">–</span><span class="metric-unit">ms</span></span>
+              <span class="metric-sub">Unloaded</span>
+            </div>
+            <div class="metric-cell" id="lat-loaded-cell" data-measuring="true">
+              <span class="metric-num"><span id="lat-loaded">–</span><span class="metric-unit">ms</span></span>
+              <span class="metric-sub">Loaded</span>
+            </div>
+          </div>
+        </div>
+        <div class="metric">
+          <h2 class="metric-title">Upload speed</h2>
+          <div class="metric-cell" id="up-cell" data-measuring="true">
+            <span class="metric-num"><span id="up-value">–</span><span class="metric-unit" id="up-units">Mbps</span></span>
+            <span class="metric-sub" id="up-status">Waiting for the download</span>
+          </div>
+        </div>
+      </div>
+
+      <dl class="facts">
+        <div class="fact"><dt>Data used</dt><dd><span id="data-down">0</span> MB down, <span id="data-up">0</span> MB up</dd></div>
+        <div class="fact"><dt>Wisp server</dt><dd id="fact-wisp">…</dd></div>
+        <div class="fact"><dt>Test servers</dt><dd id="fact-targets">…</dd></div>
+      </dl>
+
+      <div class="more-actions">
+        <button type="button" class="linkish" id="settings-btn" aria-expanded="false" aria-controls="settings">Settings</button>
+      </div>
+
+      <form class="settings" id="settings" hidden novalidate>
+        <fieldset>
+          <legend>Parallel connections</legend>
+          <label>Min <input type="number" name="connMin" min="1" max="8" step="1" inputmode="numeric" required></label>
+          <label>Max <input type="number" name="connMax" min="1" max="8" step="1" inputmode="numeric" required></label>
+        </fieldset>
+        <fieldset>
+          <legend>Test duration (seconds)</legend>
+          <label>Min <input type="number" name="durMin" min="5" max="30" step="1" inputmode="numeric" required></label>
+          <label>Max <input type="number" name="durMax" min="5" max="30" step="1" inputmode="numeric" required></label>
+        </fieldset>
+        <label class="check"><input type="checkbox" name="showAll"> Always show all metrics</label>
+        <p class="settings-err" id="settings-err" role="alert" hidden></p>
+        <div class="settings-actions">
+          <button type="submit" class="btn btn-primary">Save</button>
+          <button type="button" class="btn" id="settings-cancel">Cancel</button>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <p>Powered by G-Core</p>
+    <p class="foot-note">The Wisp relay is public at <code id="relay-url">wss://wisp.baby/</code></p>
+  </footer>
+</body>
+</html>

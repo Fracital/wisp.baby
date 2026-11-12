@@ -99,7 +99,22 @@ body {
 
 /* Header */
 
-.top { padding: 20px 24px 0; }
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 24px 0;
+}
+
+.source {
+  display: inline-flex;
+  padding: 4px;
+  margin: -4px;
+  border-radius: 6px;
+  color: var(--muted);
+  transition: color .15s;
+}
+.source:hover { color: var(--fg); }
 
 .wordmark {
   display: inline-flex;

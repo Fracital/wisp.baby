@@ -8,7 +8,10 @@ wisp.baby local dev harness (README.md). Python 3 stdlib only.
 
 http://127.0.0.1:8080  the page (site/), GET /where (dev JSON), the same
                        security headers as the boxes, with a CSP that also lets the page reach
-                       ws://127.0.0.1:* (the dev holyWisp).
+                       ws://127.0.0.1:* (the dev holyWisp). GET /live, /live/history and /you
+                       answer with made-up but moving numbers for five fake boxes (README.md
+                       "Live stats"); the dev speed test's own bytes show up in them.
+                       --no-live makes them 503, like a box whose stats are down.
 http://127.0.0.1:8081  the speed test endpoint the boxes serve on :80 (README.md
                        "Server"): GET /speedtest/range/A-B sends B-A+1 random bytes (at most
                        26214400), POST reads and drops the body (Content-Length required) and
@@ -20,9 +23,11 @@ Both listen on 127.0.0.1 only. --port and --speed-port override the defaults.
 """
 import argparse
 import json
+import math
 import os
 import re
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
@@ -39,6 +44,106 @@ CSP = ("default-src 'none'; script-src 'self' blob: 'wasm-unsafe-eval'; style-sr
        "connect-src 'self' ws://127.0.0.1:* ws://localhost:* wss://wisp.baby wss://*.wisp.baby "
        "https://cdn.jsdelivr.net blob:; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; "
        "form-action 'none'; frame-ancestors 'none'")
+
+
+class FakeStats:
+    """Moving, made-up numbers in the shape of /live, /live/history and /you (README.md
+    "Live stats"). A smooth daily curve per box plus wobble, as a pure function of time, so the
+    tail and the history agree; the dev speed test's real bytes are added on top (box 0)."""
+
+    SITES = [("iev", "Kyiv", "UA", 0.9e9), ("mia", "Miami", "US", 2.6e9), ("jnb", "Johannesburg", "ZA", 0.5e9),
+             ("ams", "Amsterdam", "NL", 1.8e9), ("mnz", "Manassas", "US", 3.1e9)]
+    STEP = 2000
+    enabled = True
+
+    def __init__(self):
+        self.start = time.time()
+        self.test_bytes = 0          # bytes the dev speed test moved (SpeedHandler adds)
+        self.test_marks = []         # (t_ms, cumulative bytes), for the box-0 rate
+        self.sessions = 0
+
+    def add_test_bytes(self, n):
+        self.test_bytes += n
+
+    def mark(self):
+        now = int(time.time() * 1000)
+        if not self.test_marks or now - self.test_marks[-1][0] >= self.STEP // 2:
+            self.test_marks.append((now, self.test_bytes))
+            self.test_marks = self.test_marks[-400:]
+
+    def test_bps(self, t):
+        # Rate of the dev speed test around time t (ms), from the marks.
+        prev = None
+        for m in self.test_marks:
+            if m[0] > t:
+                break
+            prev = m
+        nxt = next((m for m in self.test_marks if m[0] >= t + self.STEP), None)
+        if not prev or not nxt or nxt[0] == prev[0]:
+            return 0
+        return (nxt[1] - prev[1]) * 8000 / (nxt[0] - prev[0])
+
+    def rate(self, i, t):
+        base = self.SITES[i][3]
+        hours = t / 3.6e6
+        day = 0.55 + 0.45 * math.sin(2 * math.pi * (hours / 24 + i * 0.17))
+        wob = 1 + 0.12 * math.sin(t / 37000 + i) + 0.07 * math.sin(t / 9100 + 2 * i)
+        v = max(0.0, base * day * wob)
+        if i == 0:
+            v += self.test_bps(t)
+        return int(v)
+
+    def series(self, step, points, end):
+        end = end - end % step
+        t0 = end - (points - 1) * step
+        sites = {}
+        for i, (name, *_rest) in enumerate(self.SITES):
+            if step == self.STEP:
+                sites[name] = [self.rate(i, t0 + k * step) for k in range(points)]
+            else:  # an average over the bucket, from four samples
+                sites[name] = [int(sum(self.rate(i, t0 + k * step + j * step / 4) for j in range(4)) / 4)
+                               for k in range(points)]
+        return {"step": step, "t0": t0, "sites": sites}
+
+    def live(self):
+        self.mark()
+        now = int(time.time() * 1000)
+        tail = self.series(self.STEP, 30, now)
+        last = {name: tail["sites"][name][-1] for name, *_ in self.SITES}
+        total = sum(last.values())
+        sites = [{"site": n, "city": c, "country": cc, "up": True, "downBps": int(last[n] * 0.93),
+                  "upBps": int(last[n] * 0.07), "sessionsActive": int(last[n] / 4.2e6)}
+                 for n, c, cc, _ in self.SITES]
+        gb = 1e9
+        return {
+            "served": now, "stale": False, "v": 1, "ts": tail["t0"] + 29 * self.STEP,
+            "now": {"downBps": int(total * 0.93), "upBps": int(total * 0.07),
+                    "sessionsActive": int(total / 4.2e6), "streamsActive": int(total / 0.9e6)},
+            "peak24h": {"bps": int(total * 1.31), "at": now - 5 * 3600 * 1000},
+            "totals": {"h5": {"bytes": int(4.1e12), "sessions": 15611},
+                       "d7": {"bytes": int(130e12), "sessions": 495372},
+                       "d30": {"bytes": int(512e12), "sessions": 1688441},
+                       "all": {"bytes": int(519e12 + self.test_bytes), "sessions": 1701045,
+                               "since": now - 31 * 86400 * 1000}},
+            "speedtest": {"h5": int(18 * gb + self.test_bytes), "d7": int(410 * gb), "d30": int(1.6e12),
+                          "all": int(1.7e12)},
+            "clients": {"today": 3121, "d30": 47672, "ipDays30": 61204},
+            "byodDomains": 37,
+            "sites": sites,
+            "tail": tail,
+        }
+
+    def history(self):
+        now = int(time.time() * 1000)
+        return {"v": 1, "ts": now, "m10": self.series(self.STEP, 300, now),
+                "h24": self.series(300000, 288, now), "d7": self.series(3600000, 168, now)}
+
+    def you(self, addr):
+        return {"v": 1, "ip": addr, "city": "Localhost", "country": "--", "site": "mnz", "rttMs": 0.1,
+                "openSessions": 0, "day": {"bytes": self.test_bytes, "sessions": self.sessions}}
+
+
+STATS = FakeStats()
 
 
 class Server(ThreadingHTTPServer):
@@ -63,20 +168,33 @@ class SiteHandler(SimpleHTTPRequestHandler):
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.send_header("Content-Security-Policy", CSP)
         path = self.path.split("?", 1)[0]
-        if path != "/where":
+        if path not in ("/where", "/live", "/live/history", "/you"):
             self.send_header("Cache-Control", "no-cache")  # dev: always revalidate
         super().end_headers()
+
+    def _json(self, status, obj, cache="no-store"):
+        body = json.dumps(obj, separators=(",", ":")).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", cache)
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path == "/where":
-            body = json.dumps(self.where, separators=(",", ":")).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
+            self._json(200, self.where)
+            return
+        if path in ("/live", "/live/history", "/you"):
+            if not FakeStats.enabled:
+                self._json(503, {"v": 1, "stale": True})
+            elif path == "/live":
+                self._json(200, STATS.live(), "public, max-age=1")
+            elif path == "/live/history":
+                self._json(200, STATS.history(), "public, max-age=30")
+            else:
+                self._json(200, STATS.you(self.client_address[0]))
             return
         # Same surface as the boxes: no dotfiles, no directory listings.
         if any(part.startswith(".") for part in path.split("/")) or (path.endswith("/") and path != "/"):
@@ -131,6 +249,7 @@ class SpeedHandler(BaseHTTPRequestHandler):
         while left > 0:
             n = min(left, CHUNK)
             self.wfile.write(BUF if n == CHUNK else memoryview(BUF)[:n])
+            STATS.add_test_bytes(n)
             left -= n
 
     def do_HEAD(self):
@@ -154,6 +273,7 @@ class SpeedHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 return
             left -= len(got)
+            STATS.add_test_bytes(len(got))
         self._empty(200)
 
     def log_message(self, fmt, *args):
@@ -165,7 +285,9 @@ def main():
     ap = argparse.ArgumentParser(description="wisp.baby dev harness")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--speed-port", type=int, default=8081)
+    ap.add_argument("--no-live", action="store_true", help="answer /live, /live/history and /you with 503")
     args = ap.parse_args()
+    FakeStats.enabled = not args.no_live
 
     if not os.path.isdir(SITE):
         sys.exit("serve.py: %s does not exist (site/)" % SITE)

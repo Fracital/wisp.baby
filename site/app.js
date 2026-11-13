@@ -1,6 +1,7 @@
 // wisp.baby UI. The engine (speedtest.js) does the measuring; this file only
 // drives it and draws what it reports. Contract: README.md.
 import { createSpeedtest } from "./speedtest.js";
+import * as ls from "./livestats.js";
 
 const LIBCURL_BASE = "https://cdn.jsdelivr.net/npm/libcurl.js@0.7.4/";
 const MODES = ["gcore", "netflix"];
@@ -238,7 +239,7 @@ async function start() {
   const on = (ev, fn) => t.on(ev, (d) => { if (my === run && test === t) fn(d || {}); });
 
   on("phase", ({ phase }) => {
-    if (phase === "done") { setPhase("idle"); test = null; return; }
+    if (phase === "done") { setPhase("idle"); test = null; refreshYouSoon(); return; }
     setPhase(phase);
     if (phase === "upload") $("up-status").textContent = "Measuring…";
     if (phase === "latency") $("up-status").textContent = "Up next";
@@ -406,7 +407,470 @@ else {
   try { history.replaceState(null, "", `${location.pathname}${location.search}#${mode}`); } catch { /* ignore */ }
 }
 
+// ---------- live stats (README.md "Live stats"; the maths is livestats.js) ----------
+
+const KEY_VIEW = "wispbaby.liveView";
+const LIVE_EVERY = 2000;          // /live
+const YOU_EVERY = 15000;          // /you
+const HISTORY_EVERY = 60000;      // /live/history, while a long view is showing
+const SVG_NS = "http://www.w3.org/2000/svg";
+const reducedMotion = (() => {
+  try { return matchMedia("(prefers-reduced-motion: reduce)"); } catch { return { matches: false }; }
+})();
+
+const lv = {
+  data: null,           // last /live
+  you: null,            // last /you
+  sites: [],            // site names in /live order (the colour follows the site: its index here)
+  windows: { m10: null, h24: null, d7: null },
+  view: ls.VIEWS[load(KEY_VIEW)] ? load(KEY_VIEW) : "m10",
+  timers: { live: 0, you: 0, history: 0 },
+  historyAt: 0,
+  failures: 0,
+  hover: null,          // slot index under the pointer, or null
+  geom: null,           // last drawn geometry, for the hover layer
+};
+
+async function getJson(url) {
+  const res = await fetch(url, { cache: "no-store", credentials: "omit" });
+  if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+  return res.json();
+}
+
+const timeFmt = {};
+function fmtTime(t, kind) {
+  const opts = {
+    tick: { hour: "2-digit", minute: "2-digit" },
+    day: { weekday: "short" },
+    m10: { hour: "2-digit", minute: "2-digit", second: "2-digit" },
+    h24: { hour: "2-digit", minute: "2-digit" },
+    d7: { weekday: "short", hour: "2-digit", minute: "2-digit" },
+  }[kind];
+  try {
+    timeFmt[kind] ||= new Intl.DateTimeFormat(undefined, opts);
+    return timeFmt[kind].format(new Date(t));
+  } catch { return new Date(t).toISOString().slice(11, 16); }
+}
+
+function setText(id, text) {
+  const el = $(id);
+  if (el && el.textContent !== text) el.textContent = text;
+}
+
+function rateText(bps) {
+  const { value, units } = ls.fmtRate(bps);
+  return `${value} ${units}`;
+}
+function bytesText(b) {
+  const { value, units } = ls.fmtBytes(b);
+  return `${value} ${units}`;
+}
+
+// ---------- polling ----------
+
+function hiddenTab() {
+  // Also true once the panel is hidden for good (a box without stats): nothing polls then.
+  return document.visibilityState === "hidden" || $("live").hidden;
+}
+
+async function pollLive() {
+  clearTimeout(lv.timers.live);
+  if (hiddenTab()) return;
+  try {
+    const d = await getJson("/live");
+    lv.failures = 0;
+    onLive(d);
+  } catch (e) {
+    // 404: this box serves no stats (not set up yet). Hide the panel and stop asking.
+    if (e?.status === 404 && !lv.data) {
+      $("live").hidden = true;
+      clearTimeout(lv.timers.you);
+      return;
+    }
+    lv.failures++;
+    if (lv.failures >= 2) {
+      $("live").dataset.state = "offline";
+      setText("live-now-sub", "the stats can't be reached right now, retrying");
+    }
+  }
+  // Back off while the stats are down: 2 s, 4 s, … up to 30 s.
+  const wait = Math.min(30000, LIVE_EVERY * 2 ** Math.max(0, lv.failures - 1));
+  lv.timers.live = setTimeout(pollLive, wait);
+}
+
+async function pollYou() {
+  clearTimeout(lv.timers.you);
+  if (hiddenTab()) return;
+  try { drawYou(await getJson("/you")); } catch { /* keep the last numbers */ }
+  lv.timers.you = setTimeout(pollYou, YOU_EVERY);
+}
+
+// After a speed test the visitor's own traffic just moved: show it.
+function refreshYouSoon() {
+  clearTimeout(lv.timers.you);
+  lv.timers.you = setTimeout(pollYou, 1500);
+}
+
+async function pollHistory(force = false) {
+  clearTimeout(lv.timers.history);
+  if (hiddenTab()) return;
+  if (force || Date.now() - lv.historyAt > HISTORY_EVERY - 1000) {
+    try {
+      onHistory(await getJson("/live/history"));
+      lv.historyAt = Date.now();
+    } catch { /* the 10 min view still fills from /live */ }
+  }
+  if (lv.view !== "m10") lv.timers.history = setTimeout(pollHistory, HISTORY_EVERY);
+}
+
+function startLive() {
+  drawTabs();
+  sizeChart();
+  pollHistory(true).then(() => pollLive());
+  pollYou();
+  document.addEventListener("visibilitychange", () => {
+    if (hiddenTab()) return;
+    pollLive();
+    pollYou();
+    if (lv.view !== "m10") pollHistory();
+  });
+}
+
+// ---------- data in ----------
+
+function ensureSites(names) {
+  if (names.length && names.join() !== lv.sites.join()) {
+    lv.sites = names;
+    // A window made for other sites is rebuilt from the next data.
+    for (const k of Object.keys(lv.windows)) {
+      const w = lv.windows[k];
+      if (w && Object.keys(w.values).join() !== names.join()) lv.windows[k] = null;
+    }
+  }
+}
+
+function onHistory(h) {
+  if (!h || h.v !== 1) return;
+  const names = Object.keys(h.m10?.sites || h.h24?.sites || {});
+  if (!lv.sites.length) ensureSites(names);
+  for (const k of ["h24", "d7"]) {
+    if (h[k]) lv.windows[k] = ls.windowFrom(h[k], ls.VIEWS[k].points, lv.sites);
+  }
+  if (!lv.windows.m10 && h.m10) lv.windows.m10 = ls.windowFrom(h.m10, ls.VIEWS.m10.points, lv.sites);
+  if (lv.view !== "m10") drawChart(0);
+}
+
+function onLive(d) {
+  if (!d || d.v !== 1) return;
+  lv.data = d;
+  const sites = ls.liveSites(d);
+  ensureSites(sites.map((s) => s.site));
+  let slid = 0;
+  if (d.tail) {
+    if (!lv.windows.m10) {
+      const len = Math.max(0, ...Object.values(d.tail.sites || {}).map((a) => a.length));
+      lv.windows.m10 = ls.emptyWindow(d.tail.step, ls.VIEWS.m10.points, d.tail.t0 + (len - 1) * d.tail.step, lv.sites);
+    }
+    slid = ls.mergeTail(lv.windows.m10, d.tail);
+  }
+  const age = ls.liveAge(d);
+  $("live").dataset.state = d.stale || age > 15000 ? "stale" : "live";
+  drawNow(d, sites);
+  drawSites(sites);
+  drawTotals(d);
+  if (lv.you) drawYou(lv.you);  // the box's city comes from /live
+  if (lv.view === "m10") drawChart(slid);
+}
+
+// ---------- drawing: numbers ----------
+
+function drawNow(d, sites) {
+  const total = (Number(d.now?.downBps) || 0) + (Number(d.now?.upBps) || 0);
+  const { value, units } = ls.fmtRate(total);
+  setText("live-rate", value);
+  setText("live-rate-units", units);
+  const up = sites.filter((s) => s.up).length;
+  const stale = $("live").dataset.state === "stale";
+  const boxes = up === sites.length ? `all ${sites.length} boxes` : `${up} of ${sites.length} boxes`;
+  setText("live-now-sub", stale
+    ? `last heard ${Math.round(ls.liveAge(d) / 1000)} s ago`
+    : `${rateText(d.now?.downBps)} down, ${rateText(d.now?.upBps)} up, across ${boxes}`);
+}
+
+function drawSites(sites) {
+  const ul = $("sites");
+  if (ul.children.length !== sites.length) {
+    ul.replaceChildren(...sites.map((s, i) => {
+      const li = document.createElement("li");
+      li.className = `site s${i}`;
+      const sw = document.createElement("span");
+      sw.className = "site-swatch";
+      sw.setAttribute("aria-hidden", "true");
+      const code = document.createElement("span");
+      code.className = "site-code";
+      const city = document.createElement("span");
+      city.className = "site-city";
+      const rate = document.createElement("span");
+      rate.className = "site-rate";
+      li.append(sw, code, city, rate);
+      return li;
+    }));
+  }
+  sites.forEach((s, i) => {
+    const li = ul.children[i];
+    li.dataset.up = s.up ? "true" : "false";
+    li.children[1].textContent = ls.siteCode(s.site);
+    li.children[2].textContent = s.city || s.site;
+    li.children[3].textContent = s.up ? rateText(s.bps) : "offline";
+  });
+}
+
+function drawTotals(d) {
+  const t = d.totals || {};
+  for (const k of ["h5", "d7", "d30", "all"]) {
+    setText(`t-bytes-${k}`, t[k] ? bytesText(t[k].bytes) : "–");
+    setText(`t-sess-${k}`, t[k] ? ls.fmtCount(t[k].sessions) : "–");
+    setText(`t-st-${k}`, d.speedtest && Number.isFinite(d.speedtest[k]) ? bytesText(d.speedtest[k]) : "–");
+  }
+  setText("g-open", ls.fmtCount(d.now?.sessionsActive));
+  setText("g-today", d.clients ? ls.fmtCount(d.clients.today) : "–");
+  setText("g-d30", d.clients ? ls.fmtCount(d.clients.d30) : "–");
+  setText("g-ipdays", d.clients ? ls.fmtCount(d.clients.ipDays30) : "–");
+  setText("g-peak", d.peak24h?.bps ? `${rateText(d.peak24h.bps)} at ${fmtTime(d.peak24h.at, "h24")}` : "–");
+  setText("g-byod", Number.isFinite(d.byodDomains) ? ls.fmtCount(d.byodDomains) : "–");
+  const since = d.totals?.all?.since;
+  $("t-bytes-all").title = since ? `Since ${new Date(since).toLocaleDateString()}` : "";
+}
+
+function drawYou(y) {
+  if (!y || y.v !== 1) return;
+  lv.you = y;
+  setText("you-ip", y.ip || "–");
+  setText("you-geo", [y.city, y.country].filter(Boolean).join(", ") || "Unknown");
+  const site = lv.data ? ls.liveSites(lv.data).find((s) => s.site === y.site) : null;
+  const city = site?.city || (where?.site === y.site ? where.city : "");
+  setText("you-box", city ? `${ls.siteCode(y.site)}, ${city}` : ls.siteCode(y.site) || "–");
+  setText("you-rtt", Number.isFinite(y.rttMs) ? `${ls.fmtMs(y.rttMs)} ms (TCP, measured by the box)` : "–");
+  setText("you-open", ls.fmtCount(y.openSessions));
+  const day = y.day || {};
+  const n = Number(day.sessions) || 0;
+  setText("you-day", `${bytesText(day.bytes)} in ${ls.fmtCount(n)} ${n === 1 ? "session" : "sessions"}`);
+}
+
+// ---------- drawing: the graph ----------
+
+const CH = { left: 44, right: 8, top: 10, bottom: 24 };
+
+function sizeChart() {
+  const plot = $("chart-plot");
+  const redraw = () => drawChart(0);
+  try { new ResizeObserver(redraw).observe(plot); } catch { addEventListener("resize", redraw); }
+}
+
+function svgEl(name, attrs = {}) {
+  const el = document.createElementNS(SVG_NS, name);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  return el;
+}
+
+function drawChart(slid) {
+  const w = lv.windows[lv.view];
+  const svg = $("chart-svg");
+  const plot = $("chart-plot");
+  const width = Math.max(200, plot.clientWidth);
+  const height = plot.clientHeight || 200;
+  const iw = width - CH.left - CH.right;
+  const ih = height - CH.top - CH.bottom;
+  const hasData = w && ls.lastFilled(w) >= 0;
+  $("chart-empty").hidden = !!hasData;
+  if (!hasData || iw <= 0 || ih <= 0) { svg.replaceChildren(); lv.geom = null; return; }
+
+  const g = ls.stackGeometry(w, lv.sites, iw, ih);
+  lv.geom = { w, g, iw, ih, width, height };
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("width", width);
+  svg.setAttribute("height", height);
+
+  const frag = document.createDocumentFragment();
+  const defs = svgEl("defs");
+  const clip = svgEl("clipPath", { id: "chart-clip" });
+  clip.append(svgEl("rect", { x: 0, y: -2, width: iw, height: ih + 4 }));
+  defs.append(clip);
+  frag.append(defs);
+
+  // Grid and y labels (one unit for the whole axis).
+  const grid = svgEl("g", { class: "chart-grid", transform: `translate(${CH.left} ${CH.top})` });
+  const yt = ls.rateTicks(g.ticks);
+  g.ticks.forEach((v, i) => {
+    const y = Math.round(g.y(v)) + 0.5;
+    grid.append(svgEl("line", { x1: 0, x2: iw, y1: y, y2: y }));
+    const label = svgEl("text", { x: -8, y, class: "chart-ylabel", "text-anchor": "end", "dominant-baseline": "middle" });
+    label.textContent = i === g.ticks.length - 1 ? `${yt.labels[i]} ${yt.units}` : yt.labels[i];
+    grid.append(label);
+  });
+  frag.append(grid);
+
+  // X labels.
+  const xg = svgEl("g", { class: "chart-x", transform: `translate(${CH.left} ${CH.top + ih})` });
+  const ticks = ls.timeTicks(lv.view, w, (t, view) => fmtTime(t, view === "h24" ? "tick" : "day"));
+  const minGap = 56;
+  let lastX = -Infinity;
+  for (const t of ticks) {
+    const x = t.i * g.dx;
+    if (x - lastX < minGap) continue;
+    lastX = x;
+    const anchor = x < 20 ? "start" : x > iw - 20 ? "end" : "middle";
+    const label = svgEl("text", { x, y: 17, "text-anchor": anchor, class: "chart-xlabel" });
+    label.textContent = t.label;
+    xg.append(label);
+  }
+  frag.append(xg);
+
+  // The bands, bottom to top, inside the clip. The 10 min view slides new samples in.
+  const clipped = svgEl("g", { "clip-path": "url(#chart-clip)", transform: `translate(${CH.left} ${CH.top})` });
+  const bands = svgEl("g", { class: "chart-bands" });
+  g.bands.forEach((b, i) => {
+    bands.append(svgEl("path", { d: b.area, class: `band-area s${i}` }));
+  });
+  g.bands.forEach((b, i) => {
+    bands.append(svgEl("path", { d: b.line, class: `band-line s${i}` }));
+  });
+  clipped.append(bands);
+  frag.append(clipped);
+
+  // Hover layer: crosshair and a dot per band top.
+  const hover = svgEl("g", { class: "chart-hover", transform: `translate(${CH.left} ${CH.top})`, visibility: "hidden" });
+  hover.append(svgEl("line", { class: "chart-cross", x1: 0, x2: 0, y1: 0, y2: ih }));
+  lv.sites.forEach((_, i) => hover.append(svgEl("circle", { class: `chart-mark s${i}`, r: 4, cx: 0, cy: 0 })));
+  frag.append(hover);
+
+  svg.replaceChildren(frag);
+
+  if (slid > 0 && lv.view === "m10" && !reducedMotion.matches && slid < 10) {
+    bands.style.transform = `translateX(${slid * g.dx}px)`;
+    void bands.getBoundingClientRect();
+    bands.style.transition = `transform ${LIVE_EVERY * 0.95}ms linear`;
+    bands.style.transform = "translateX(0)";
+  }
+  if (lv.hover !== null) drawHover(lv.hover);
+  drawCaption();
+}
+
+function drawCaption() {
+  const w = lv.windows[lv.view];
+  if (!w) return;
+  let peak = 0;
+  for (let i = 0; i < w.points; i++) peak = Math.max(peak, ls.totalAt(w, i) || 0);
+  const last = ls.lastFilled(w);
+  const now = last >= 0 ? ls.totalAt(w, last) : 0;
+  const span = ls.VIEWS[lv.view].label;
+  setText("chart-caption", `Relay throughput by box over the last ${span}: latest ${rateText(now)}, peak ${rateText(peak)}.`);
+  setText("chart-peak", peak > 0 ? `peak ${rateText(peak)}` : "");
+}
+
+function drawHover(i) {
+  const gm = lv.geom;
+  const tip = $("chart-tip");
+  const layer = $("chart-svg").querySelector(".chart-hover");
+  if (!gm || !layer || i === null) { tip.hidden = true; if (layer) layer.setAttribute("visibility", "hidden"); return; }
+  const { w, g, iw } = gm;
+  const total = ls.totalAt(w, i);
+  if (total === null) { tip.hidden = true; layer.setAttribute("visibility", "hidden"); return; }
+  const x = i * g.dx;
+  layer.setAttribute("visibility", "visible");
+  const cross = layer.querySelector(".chart-cross");
+  cross.setAttribute("x1", x);
+  cross.setAttribute("x2", x);
+  let acc = 0;
+  const marks = layer.querySelectorAll(".chart-mark");
+  lv.sites.forEach((s, k) => {
+    acc += Number(w.values[s][i]) || 0;
+    marks[k].setAttribute("cx", x);
+    marks[k].setAttribute("cy", g.y(acc));
+  });
+
+  // Values lead, names follow; top band first, as the stack reads.
+  const rows = lv.sites.map((s, k) => ({ s, k, v: Number(w.values[s][i]) || 0 })).reverse();
+  const head = document.createElement("p");
+  head.className = "tip-head";
+  const tt = document.createElement("strong");
+  tt.textContent = rateText(total);
+  const when = document.createElement("span");
+  when.textContent = fmtTime(w.t0 + i * w.step, lv.view);
+  head.append(tt, when);
+  const list = document.createElement("ul");
+  for (const r of rows) {
+    const li = document.createElement("li");
+    li.className = `s${r.k}`;
+    const key = document.createElement("span");
+    key.className = "tip-key";
+    const v = document.createElement("strong");
+    v.textContent = rateText(r.v);
+    const name = document.createElement("span");
+    name.textContent = ls.siteCode(r.s);
+    li.append(key, v, name);
+    list.append(li);
+  }
+  tip.replaceChildren(head, list);
+  tip.hidden = false;
+  const px = CH.left + x;
+  const tw = tip.offsetWidth;
+  const left = px + 14 + tw > gm.width ? px - 14 - tw : px + 14;
+  tip.style.transform = `translate(${Math.max(0, left)}px, ${CH.top}px)`;
+}
+
+{
+  const plot = $("chart-plot");
+  const at = (e) => {
+    const gm = lv.geom;
+    if (!gm) return null;
+    const r = plot.getBoundingClientRect();
+    const x = e.clientX - r.left - CH.left;
+    if (x < -8 || x > gm.iw + 8) return null;
+    return ls.slotAt(x, gm.iw, gm.w.points);
+  };
+  plot.addEventListener("pointermove", (e) => { lv.hover = at(e); drawHover(lv.hover); });
+  plot.addEventListener("pointerleave", () => { lv.hover = null; drawHover(null); });
+}
+
+// ---------- tabs ----------
+
+function drawTabs() {
+  for (const b of document.querySelectorAll("#chart-tabs .tab")) {
+    const on = b.dataset.view === lv.view;
+    b.setAttribute("aria-selected", on ? "true" : "false");
+    b.tabIndex = on ? 0 : -1;
+  }
+  $("chart-plot").setAttribute("aria-labelledby", `tab-${lv.view}`);
+}
+
+function setView(v) {
+  if (!ls.VIEWS[v] || v === lv.view) return;
+  lv.view = v;
+  save(KEY_VIEW, v);
+  lv.hover = null;
+  drawTabs();
+  drawHover(null);
+  drawChart(0);
+  if (v !== "m10") pollHistory();
+}
+
+$("chart-tabs").addEventListener("click", (e) => {
+  const b = e.target.closest(".tab");
+  if (b) setView(b.dataset.view);
+});
+$("chart-tabs").addEventListener("keydown", (e) => {
+  const order = Object.keys(ls.VIEWS);
+  const d = { ArrowLeft: -1, ArrowRight: 1 }[e.key];
+  if (!d) return;
+  e.preventDefault();
+  const next = order[(order.indexOf(lv.view) + d + order.length) % order.length];
+  setView(next);
+  $(`tab-${next}`).focus();
+});
+
 drawMode();
 drawWhere();
 setMore(settings.showAll);
+startLive();
 start();

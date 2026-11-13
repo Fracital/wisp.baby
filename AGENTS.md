@@ -85,7 +85,7 @@ to the server contract (a new endpoint, header, limit or `/where` field) also la
   in try/catch (see `app.js`) and fall back to the defaults.
 - Light and dark both work, and the page works at phone width. Check both after any change to
   `index.html` or `styles.css`.
-- Keep `speedtest.js` free of DOM access. It is the engine, it runs unchanged in Node for the
+- Keep `speedtest.js` and `livestats.js` free of DOM access. They run unchanged in Node for the
   tests, and `app.js` is the only file that touches the document.
 
 ## The engine (do not regress)

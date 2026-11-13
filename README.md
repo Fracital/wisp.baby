@@ -14,8 +14,9 @@ It is a small static page with no build step.
 | `site/styles.css` | Styles (light and dark). |
 | `site/app.js` | UI: big number, mode switch, more info, settings. ES module. |
 | `site/speedtest.js` | Engine: Wisp v1 client, HTTP/1.1 over a Wisp stream, the fast.com algorithm. ES module, no dependencies. |
+| `site/livestats.js` | Live stats maths: formatting, the graph's series window and stacked-area geometry. No DOM; `app.js` draws. |
 | `site/favicon.svg` | Icon. |
-| `dev/serve.py` | Local harness: serves `site/`, `/where`, `/speedtest/range/*`, and points the page at a local holyWisp. |
+| `dev/serve.py` | Local harness: serves `site/`, `/where`, made-up `/live`, `/live/history` and `/you`, `/speedtest/range/*`, and points the page at a local holyWisp. |
 | `dev/run-holywisp.sh` | Fetches holyWisp from npm (integrity checked) and runs it on `ws://127.0.0.1:6011/` with a dev config. |
 | `test/` | `node --test 'test/*.test.mjs'`. The end-to-end test runs only with `HOLYWISP_BIN` set. |
 
@@ -54,6 +55,7 @@ HTTPS (443):
   `{"site":"chi","host":"chi.wisp.baby","city":"Chicago","country":"US","addr":"<$server_addr, the address the browser reached>","speedPort":80}`
   (`speedPort` is 80 on the boxes; the dev harness uses another port.)
 - `GET /health`: holyWisp's health.
+- `GET /live`, `GET /live/history`, `GET /you`: live usage stats, see "Live stats" below.
 
 HTTP (80), from the box's own addresses only (anything else: 403):
 - `GET /speedtest/range/A-B`: `B-A+1` bytes of incompressible data, `Content-Length`, `Cache-Control: no-store`, keep-alive. `A-B` capped at 25 MiB (26214400 bytes).
@@ -138,6 +140,70 @@ phases reuse them: Chrome holds a new WebSocket handshake to the same endpoint f
 it are saturated with uploads, which left ramp workers idle and restarted the test on the 10 s handshake timeout.
 Upload progress counts bytes that have left the WebSocket: bytes handed to `ws.send` minus `ws.bufferedAmount`,
 sending only while the stream's Wisp CONTINUE window allows and `bufferedAmount` is under a few MiB.
+
+## Live stats
+
+Under the speed test the page shows what the relay is doing: a live graph of throughput by box,
+totals for all of them, and the visitor's own numbers. The page polls `/live` every 2 s (paused
+while the tab is hidden, backing off to 30 s while it fails), `/you` every 15 s and right after a
+test, and `/live/history` when a long view is open.
+
+How the numbers get there (all in abulxt; nothing here talks to anything but the box it was loaded
+from):
+
+1. Every 2 s each box's OpenResty reads its holyWisp's loopback `/stats` (bytes), adds its own
+   counters (relay sessions, open sessions, speed test bytes) and writes them to a Redis hash on
+   abulxt's origin. In the same round trip it reads back the two blobs below.
+2. A collector on the origin turns the five boxes' counters into rates and totals, keeps the last
+   10 minutes in memory and per-minute and per-hour rows in Postgres, and writes the blobs.
+3. Each box serves the blobs from its own shared memory, so a page poll never reaches Redis or
+   Postgres.
+
+Sessions are WebSocket upgrades on the relay (wisp.baby, abulxt's byod and Fracital's relay names,
+all on the same holyWisp). Bytes are holyWisp's, so they include the speed tests, which are also
+counted on their own.
+
+Privacy: the stats are counters. Distinct clients are a HyperLogLog of a salted HMAC of the client
+address (the same salt on every box, kept secret), kept 35 days. A visitor's own numbers are kept
+on the box they used, under that HMAC, in hourly buckets that expire after 25 hours. No address is
+written to Redis, Postgres or a log by any of this.
+
+`GET /live` (`application/json`, `Cache-Control: public, max-age=1`; 503 `{"v":1,"stale":true}`
+before the box has had any):
+
+```json
+{
+  "served": 1763000001500, "stale": false,
+  "v": 1, "ts": 1763000000000,
+  "now": { "downBps": 0, "upBps": 0, "sessionsActive": 0, "streamsActive": 0 },
+  "peak24h": { "bps": 0, "at": 1763000000000 },
+  "totals": { "h5": { "bytes": 0, "sessions": 0 }, "d7": { "bytes": 0, "sessions": 0 },
+              "d30": { "bytes": 0, "sessions": 0 }, "all": { "bytes": 0, "sessions": 0, "since": 1763000000000 } },
+  "speedtest": { "h5": 0, "d7": 0, "d30": 0, "all": 0 },
+  "clients": { "today": 0, "d30": 0, "ipDays30": 0 },
+  "byodDomains": 0,
+  "sites": [ { "site": "mia", "city": "Miami", "country": "US", "up": true, "downBps": 0, "upBps": 0, "sessionsActive": 0 } ],
+  "tail": { "step": 2000, "t0": 1763000000000, "sites": { "mia": [0] } }
+}
+```
+
+- Rates are bits per second, sizes bytes, times ms since the epoch. "down" is toward the client.
+- `served` is the box's clock when it answered; `stale` is true when the box has not had a fresh
+  blob for more than 10 s (the origin or its Redis is unreachable); `served - ts` is the age.
+- `sites` is in a fixed order; the page colours each box by its place in it.
+- `tail` is the last 30 samples, 2 s apart, of each box's total (down + up); `t0` is the first.
+- `clients.today` is distinct clients this UTC day, `d30` over the last 30 days, `ipDays30` the
+  sum of the daily counts. `byodDomains` counts certificates for names that are not ours.
+
+`GET /live/history` (`max-age=30`): `{ "v": 1, "ts", "m10", "h24", "d7" }`, each
+`{ "step", "t0", "sites": { "<site>": [bps, …] } }`: 300 × 2 s samples, 288 × 5 min averages and
+168 × 1 h averages, oldest first.
+
+`GET /you` (`no-store`):
+`{ "v": 1, "ip", "city", "country", "site", "rttMs", "openSessions", "day": { "bytes", "sessions" } }`.
+`city` and `country` come from DB-IP City Lite (CC BY 4.0, credited on the page) and are `null`
+when unknown. `rttMs` is the kernel's smoothed TCP RTT for the visitor's connection to the box.
+`day` is the last 24 hours on this box, counted as each session closes.
 
 ## License
 

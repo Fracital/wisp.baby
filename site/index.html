@@ -128,6 +128,72 @@
         </div>
       </form>
     </section>
+
+    <section class="live" id="live" aria-labelledby="live-title" data-state="loading">
+      <header class="live-head">
+        <h2 class="live-title" id="live-title"><span class="live-dot" aria-hidden="true"></span>Live on the relay</h2>
+        <p class="live-now">
+          <span class="live-now-num"><span id="live-rate">–</span><span class="live-now-unit" id="live-rate-units">Gbps</span></span>
+          <span class="live-now-sub" id="live-now-sub">through all five boxes, right now</span>
+        </p>
+      </header>
+
+      <figure class="chart" id="chart">
+        <div class="chart-bar">
+          <div class="tabs" role="tablist" aria-label="Graph time range" id="chart-tabs">
+            <button type="button" role="tab" class="tab" data-view="m10" id="tab-m10" aria-selected="true" aria-controls="chart-plot">10 min</button>
+            <button type="button" role="tab" class="tab" data-view="h24" id="tab-h24" aria-selected="false" aria-controls="chart-plot" tabindex="-1">24 h</button>
+            <button type="button" role="tab" class="tab" data-view="d7" id="tab-d7" aria-selected="false" aria-controls="chart-plot" tabindex="-1">7 days</button>
+          </div>
+          <span class="chart-peak" id="chart-peak"></span>
+        </div>
+        <div class="chart-plot" id="chart-plot" role="tabpanel" aria-labelledby="tab-m10">
+          <svg class="chart-svg" id="chart-svg" aria-hidden="true" focusable="false"></svg>
+          <div class="chart-tip" id="chart-tip" hidden></div>
+          <p class="chart-empty" id="chart-empty">Collecting the first samples…</p>
+        </div>
+        <figcaption class="sr-only" id="chart-caption">Relay throughput by box.</figcaption>
+        <ul class="sites" id="sites" aria-label="The five boxes, right now"></ul>
+      </figure>
+
+      <div class="panels">
+        <section class="panel" aria-labelledby="you-title">
+          <h3 class="panel-title" id="you-title">You</h3>
+          <dl class="kv" id="you">
+            <div><dt>Your IP</dt><dd><code id="you-ip">–</code></dd></div>
+            <div><dt>Location</dt><dd id="you-geo">–</dd></div>
+            <div><dt>Your box</dt><dd id="you-box">–</dd></div>
+            <div><dt>Round trip</dt><dd id="you-rtt">–</dd></div>
+            <div><dt>Open sessions</dt><dd id="you-open">–</dd></div>
+            <div><dt>Last 24 h</dt><dd id="you-day">–</dd></div>
+          </dl>
+        </section>
+
+        <section class="panel" aria-labelledby="all-title">
+          <h3 class="panel-title" id="all-title">Everyone</h3>
+          <table class="totals">
+            <thead>
+              <tr><th scope="col"><span class="sr-only">Measure</span></th><th scope="col">5 h</th><th scope="col">7 d</th><th scope="col">30 d</th><th scope="col">All time</th></tr>
+            </thead>
+            <tbody>
+              <tr><th scope="row">Data moved</th><td id="t-bytes-h5">–</td><td id="t-bytes-d7">–</td><td id="t-bytes-d30">–</td><td id="t-bytes-all">–</td></tr>
+              <tr><th scope="row">Speed tests</th><td id="t-st-h5">–</td><td id="t-st-d7">–</td><td id="t-st-d30">–</td><td id="t-st-all">–</td></tr>
+              <tr><th scope="row">Sessions</th><td id="t-sess-h5">–</td><td id="t-sess-d7">–</td><td id="t-sess-d30">–</td><td id="t-sess-all">–</td></tr>
+            </tbody>
+          </table>
+          <dl class="kv kv-tight">
+            <div><dt>Open right now</dt><dd id="g-open">–</dd></div>
+            <div><dt>Clients today</dt><dd id="g-today">–</dd></div>
+            <div><dt>Clients, 30 days</dt><dd id="g-d30">–</dd></div>
+            <div><dt>IP-days, 30 days</dt><dd id="g-ipdays">–</dd></div>
+            <div><dt>Peak, 24 h</dt><dd id="g-peak">–</dd></div>
+            <div><dt>byod domains</dt><dd id="g-byod">–</dd></div>
+          </dl>
+        </section>
+      </div>
+
+      <p class="live-note" id="live-note">Counters only. No addresses are stored: distinct clients are counted with a salted hash, and your own numbers stay on your box for 24 hours. Your traffic is added up when each connection closes. Location by <a href="https://db-ip.com">DB-IP</a>.</p>
+    </section>
   </main>
 
   <footer class="foot">

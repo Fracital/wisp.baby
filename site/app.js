@@ -319,9 +319,12 @@ function setMode(next, { fromHash = false } = {}) {
   start();
 }
 
-$("switch").addEventListener("click", (e) => {
-  const btn = e.target.closest(".switch-opt");
-  if (btn) setMode(btn.dataset.mode);
+// A click anywhere on the switch, the selected side included, flips it to the next mode,
+// like a toggle. The arrow keys below still pick a side directly.
+$("switch").addEventListener("click", () => {
+  const next = MODES[(MODES.indexOf(mode) + 1) % MODES.length];
+  setMode(next);
+  $(`opt-${next}`).focus({ preventScroll: true });
 });
 
 $("switch").addEventListener("keydown", (e) => {

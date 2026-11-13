@@ -593,13 +593,26 @@ body[data-mode="gcore"] .node-oca {
   align-items: center;
   gap: 8px;
 }
+/* A solid dot, and while live a copy of it that swells and fades behind it (transform and opacity
+   only, so it stays crisp and cheap). Reduced motion leaves just the dot. */
 .live-dot {
-  width: 8px; height: 8px;
+  position: relative;
+  flex: none;
+  width: 7px; height: 7px;
   border-radius: 50%;
   background: var(--faint);
   transition: background-color .3s ease;
 }
-.live[data-state="live"] .live-dot { background: var(--live); animation: beat 2s ease-out infinite; }
+.live-dot::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: inherit;
+  opacity: 0;
+}
+.live[data-state="live"] .live-dot { background: var(--live); }
+.live[data-state="live"] .live-dot::after { animation: ping 2.4s cubic-bezier(0, 0, .2, 1) infinite; }
 .live[data-state="stale"] .live-dot { background: var(--s3); }
 .live[data-state="offline"] .live-dot { background: var(--error); }
 
@@ -787,7 +800,7 @@ body[data-mode="gcore"] .node-oca {
 @keyframes flow-out { from { background-position-x: 0; } to { background-position-x: var(--step); } }
 @keyframes pulse { 50% { opacity: .35; } }
 @keyframes squish { 45% { scale: 1.14 .92; } }
-@keyframes beat { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--live) 55%, transparent); } 100% { box-shadow: 0 0 0 7px transparent; } }
+@keyframes ping { 0% { transform: scale(1); opacity: .55; } 75%, 100% { transform: scale(2.8); opacity: 0; } }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

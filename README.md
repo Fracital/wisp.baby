@@ -30,6 +30,9 @@ python3 dev/serve.py       # http://127.0.0.1:8080/ (+ :8081 speed test)
 # open http://127.0.0.1:8080/?wisp=ws://127.0.0.1:6011/
 ```
 
+`dev/serve.py --no-live` answers the stats with 503, like a box whose stats are down;
+`--no-domains` leaves the by-domain fields out, like a v1 collector.
+
 ## Two modes (the switch on the page)
 
 - **G-Core (self-hosted)**: the test servers are the wisp box itself. Each
@@ -143,8 +146,8 @@ sending only while the stream's Wisp CONTINUE window allows and `bufferedAmount`
 
 ## Live stats
 
-Under the speed test the page shows what the relay is doing: a live graph of throughput by box,
-totals for all of them, and the visitor's own numbers. The page polls `/live` every 2 s (paused
+Under the speed test the page shows what the relay is doing: a live graph of throughput by box or
+by domain, totals for all of them, and the visitor's own numbers. The page polls `/live` every 2 s (paused
 while the tab is hidden, backing off to 30 s while it fails), `/you` every 15 s and right after a
 test, and `/live/history` when a long view is open.
 
@@ -162,6 +165,15 @@ from):
 Sessions are WebSocket upgrades on the relay (wisp.baby, abulxt's byod and Fracital's relay names,
 all on the same holyWisp). Bytes are holyWisp's, so they include the speed tests, which are also
 counted on their own.
+
+By domain: every relay route tags its sessions with the organization whose domain they came in on:
+Abstract (abulxt's byod names), Fracital (Fracital's names and holywisp.fracit.al), STomp
+(stomp.fracit.al), wisp.baby for wisp.baby's own relay and speed test, and "other" for the rest. Sessions per domain are exact. Bytes per domain are an
+estimate, because holyWisp only counts bytes box-wide and a WebSocket's own byte count is only known
+when it closes. So each box splits every 2 s of its traffic across the domains by their open
+sessions, weighted by the bytes per second of each domain's recently finished sessions. The domains
+always add up to the box. The labels come from the collector's config. Changing them never changes
+the history, which is stored by tag.
 
 Privacy: the stats are counters. Distinct clients are a HyperLogLog of a salted HMAC of the client
 address (the same salt on every box, kept secret), kept 35 days. A visitor's own numbers are kept
@@ -194,10 +206,16 @@ before the box has had any):
 - `tail` is the last 30 samples, 2 s apart, of each box's total (down + up); `t0` is the first.
 - `clients.today` is distinct clients this UTC day, `d30` over the last 30 days, `ipDays30` the
   sum of the daily counts. `byodDomains` counts certificates for names that are not ours.
+- By domain (v1 collectors leave these out; the page then shows only the by-box view):
+  `"domains": [ { "key": "wispbaby", "label": "wisp.baby", "downBps", "upBps", "sessionsActive" } ]`
+  in a fixed order, `"other"` last; `"domainTotals": { "<key>": { "h5", "d7", "d30", "all" } }`
+  (each `{ "bytes", "sessions" }`); and `tail.domains`, built like `tail.sites`. The page colours
+  the first five domains like the boxes, folds any more into "other", and draws "other" grey.
 
-`GET /live/history` (`max-age=30`): `{ "v": 1, "ts", "m10", "h24", "d7" }`, each
-`{ "step", "t0", "sites": { "<site>": [bps, …] } }`: 300 × 2 s samples, 288 × 5 min averages and
-168 × 1 h averages, oldest first.
+`GET /live/history` (`max-age=30`): `{ "v": 1, "ts", "m10", "h24", "d7", "domainLabels" }`, each
+block `{ "step", "t0", "sites": { "<site>": [bps, …] }, "domains": { "<key>": [bps, …] } }`:
+300 × 2 s samples, 288 × 5 min averages and 168 × 1 h averages, oldest first. `domainLabels` is
+`[ { "key", "label" } ]` in the `/live` `domains` order.
 
 `GET /you` (`no-store`):
 `{ "v": 1, "ip", "city", "country", "site", "rttMs", "openSessions", "day": { "bytes", "sessions" } }`.

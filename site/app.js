@@ -410,6 +410,8 @@ else {
 // ---------- live stats (README.md "Live stats"; the maths is livestats.js) ----------
 
 const KEY_VIEW = "wispbaby.liveView";
+const KEY_SPLIT = "wispbaby.liveSplit";
+const SPLITS = ["box", "domain"];
 const LIVE_EVERY = 2000;          // /live
 const YOU_EVERY = 15000;          // /you
 const HISTORY_EVERY = 60000;      // /live/history, while a long view is showing
@@ -421,14 +423,19 @@ const reducedMotion = (() => {
 const lv = {
   data: null,           // last /live
   you: null,            // last /you
-  sites: [],            // site names in /live order (the colour follows the site: its index here)
-  windows: { m10: null, h24: null, d7: null },
+  // The graph's series per split: site names, or domain keys, in /live order. The colour follows
+  // the series: its index here ("other" is always grey).
+  keys: { box: [], domain: [] },
+  labels: {},           // domain key -> the collector's label
+  windows: { box: { m10: null, h24: null, d7: null }, domain: { m10: null, h24: null, d7: null } },
   view: ls.VIEWS[load(KEY_VIEW)] ? load(KEY_VIEW) : "m10",
+  split: SPLITS.includes(load(KEY_SPLIT)) ? load(KEY_SPLIT) : "box",
   timers: { live: 0, you: 0, history: 0 },
   historyAt: 0,
   failures: 0,
   hover: null,          // slot index under the pointer, or null
   geom: null,           // last drawn geometry, for the hover layer
+  hiddenAt: 0,          // when the tab was hidden, 0 while it shows
 };
 
 async function getJson(url) {
@@ -525,61 +532,106 @@ async function pollHistory(force = false) {
 
 function startLive() {
   drawTabs();
+  drawSplit();
   sizeChart();
   pollHistory(true).then(() => pollLive());
   pollYou();
   document.addEventListener("visibilitychange", () => {
-    if (hiddenTab()) return;
-    pollLive();
+    if (hiddenTab()) { lv.hiddenAt ||= Date.now(); return; }
+    // Opened in a background tab (nothing fetched yet), or away long enough that the 10 min graph
+    // has a gap: refill it from the history first, as on load.
+    const away = lv.hiddenAt ? Date.now() - lv.hiddenAt : 0;
+    lv.hiddenAt = 0;
+    if (!lv.historyAt || away > 30000) {
+      for (const sp of SPLITS) lv.windows[sp].m10 = null;
+      pollHistory(true).then(() => pollLive());
+    } else {
+      pollLive();
+      if (lv.view !== "m10") pollHistory();
+    }
     pollYou();
-    if (lv.view !== "m10") pollHistory();
   });
 }
 
 // ---------- data in ----------
 
-function ensureSites(names) {
-  if (names.length && names.join() !== lv.sites.join()) {
-    lv.sites = names;
-    // A window made for other sites is rebuilt from the next data.
-    for (const k of Object.keys(lv.windows)) {
-      const w = lv.windows[k];
-      if (w && Object.keys(w.values).join() !== names.join()) lv.windows[k] = null;
+const FIELD = { box: "sites", domain: "domains" };
+
+// The split on screen: by domain only once the collector sends domains.
+function split() {
+  return lv.split === "domain" && lv.keys.domain.length ? "domain" : "box";
+}
+
+function ensureKeys(sp, names) {
+  if (names.length && names.join() !== lv.keys[sp].join()) {
+    lv.keys[sp] = names;
+    // A window made for other series is rebuilt from the next data.
+    const ws = lv.windows[sp];
+    for (const k of Object.keys(ws)) {
+      if (ws[k] && Object.keys(ws[k].values).join() !== names.join()) ws[k] = null;
     }
   }
 }
 
+function setLabels(list) {
+  for (const d of list) lv.labels[d.key] = d.label;
+}
+
 function onHistory(h) {
   if (!h || h.v !== 1) return;
-  const names = Object.keys(h.m10?.sites || h.h24?.sites || {});
-  if (!lv.sites.length) ensureSites(names);
-  for (const k of ["h24", "d7"]) {
-    if (h[k]) lv.windows[k] = ls.windowFrom(h[k], ls.VIEWS[k].points, lv.sites);
+  if (!lv.keys.box.length) ensureKeys("box", Object.keys(h.m10?.sites || h.h24?.sites || {}));
+  if (!lv.keys.domain.length && Array.isArray(h.domainLabels)) {
+    const doms = ls.liveDomains({ domains: h.domainLabels });
+    setLabels(doms);
+    ensureKeys("domain", doms.map((d) => d.key));
   }
-  if (!lv.windows.m10 && h.m10) lv.windows.m10 = ls.windowFrom(h.m10, ls.VIEWS.m10.points, lv.sites);
+  for (const sp of SPLITS) {
+    const keys = lv.keys[sp];
+    if (!keys.length) continue;
+    const ws = lv.windows[sp];
+    for (const k of ["h24", "d7"]) {
+      const b = ls.seriesBlock(h[k], FIELD[sp], keys);
+      if (b) ws[k] = ls.windowFrom(b, ls.VIEWS[k].points, keys);
+    }
+    const b = !ws.m10 && ls.seriesBlock(h.m10, FIELD[sp], keys);
+    if (b) ws.m10 = ls.windowFrom(b, ls.VIEWS.m10.points, keys);
+  }
+  drawSplit();
   if (lv.view !== "m10") drawChart(0);
+}
+
+// Slides one split's 10 min window by the /live tail; returns the slots it moved.
+function mergeLive(sp, tail) {
+  const keys = lv.keys[sp];
+  const b = keys.length && ls.seriesBlock(tail, FIELD[sp], keys);
+  if (!b) return 0;
+  const ws = lv.windows[sp];
+  if (!ws.m10) {
+    const len = Math.max(0, ...Object.values(b.sites).map((a) => a.length));
+    ws.m10 = ls.emptyWindow(b.step, ls.VIEWS.m10.points, b.t0 + (len - 1) * b.step, keys);
+  }
+  return ls.mergeTail(ws.m10, b);
 }
 
 function onLive(d) {
   if (!d || d.v !== 1) return;
   lv.data = d;
   const sites = ls.liveSites(d);
-  ensureSites(sites.map((s) => s.site));
-  let slid = 0;
-  if (d.tail) {
-    if (!lv.windows.m10) {
-      const len = Math.max(0, ...Object.values(d.tail.sites || {}).map((a) => a.length));
-      lv.windows.m10 = ls.emptyWindow(d.tail.step, ls.VIEWS.m10.points, d.tail.t0 + (len - 1) * d.tail.step, lv.sites);
-    }
-    slid = ls.mergeTail(lv.windows.m10, d.tail);
-  }
+  const doms = ls.liveDomains(d);
+  ensureKeys("box", sites.map((s) => s.site));
+  setLabels(doms);
+  ensureKeys("domain", doms.map((x) => x.key));
+  const slid = {};
+  for (const sp of SPLITS) slid[sp] = d.tail ? mergeLive(sp, d.tail) : 0;
   const age = ls.liveAge(d);
   $("live").dataset.state = d.stale || age > 15000 ? "stale" : "live";
   drawNow(d, sites);
-  drawSites(sites);
+  drawSplit();
+  drawLegend();
   drawTotals(d);
+  drawDomainTotals(d, doms);
   if (lv.you) drawYou(lv.you);  // the box's city comes from /live
-  if (lv.view === "m10") drawChart(slid);
+  if (lv.view === "m10") drawChart(slid[split()]);
 }
 
 // ---------- drawing: numbers ----------
@@ -597,12 +649,37 @@ function drawNow(d, sites) {
     : `${rateText(d.now?.downBps)} down, ${rateText(d.now?.upBps)} up, across ${boxes}`);
 }
 
-function drawSites(sites) {
+// The colour class of series i of the current split: "other" is grey, never a palette slot.
+function seriesClass(key, i) {
+  return split() === "domain" && key === "other" ? "so" : `s${i}`;
+}
+
+function seriesName(key) {
+  return split() === "domain" ? lv.labels[key] || key : ls.siteCode(key);
+}
+
+// The chips under the graph: the boxes, or the domains, right now.
+function drawLegend() {
+  const d = lv.data;
+  if (!d) return;
+  const sp = split();
+  const items = sp === "domain"
+    ? ls.liveDomains(d).map((x) => ({
+      key: x.key, up: true, code: x.label,
+      sub: `${ls.fmtCount(x.sessionsActive)} open`, rate: rateText(x.bps),
+    }))
+    : ls.liveSites(d).map((s) => ({
+      key: s.site, up: s.up, code: ls.siteCode(s.site),
+      sub: s.city || s.site, rate: s.up ? rateText(s.bps) : "offline",
+    }));
   const ul = $("sites");
-  if (ul.children.length !== sites.length) {
-    ul.replaceChildren(...sites.map((s, i) => {
+  ul.setAttribute("aria-label", sp === "domain" ? "Traffic by domain, right now" : "The boxes, right now");
+  ul.style.setProperty("--n", String(Math.max(1, items.length)));
+  if (ul.children.length !== items.length || ul.dataset.split !== sp) {
+    ul.dataset.split = sp;
+    ul.replaceChildren(...items.map((it, i) => {
       const li = document.createElement("li");
-      li.className = `site s${i}`;
+      li.className = `site ${seriesClass(it.key, i)}`;
       const sw = document.createElement("span");
       sw.className = "site-swatch";
       sw.setAttribute("aria-hidden", "true");
@@ -616,12 +693,44 @@ function drawSites(sites) {
       return li;
     }));
   }
-  sites.forEach((s, i) => {
+  items.forEach((it, i) => {
     const li = ul.children[i];
-    li.dataset.up = s.up ? "true" : "false";
-    li.children[1].textContent = ls.siteCode(s.site);
-    li.children[2].textContent = s.city || s.site;
-    li.children[3].textContent = s.up ? rateText(s.bps) : "offline";
+    li.dataset.up = it.up ? "true" : "false";
+    li.children[1].textContent = it.code;
+    li.children[1].title = it.code;
+    li.children[2].textContent = it.sub;
+    li.children[3].textContent = it.rate;
+  });
+}
+
+// The by-domain rows of the Everyone panel: open now, then data moved over 5 h, 30 d and all time.
+function drawDomainTotals(d, doms) {
+  const box = $("dom-totals");
+  if (!doms.length) { box.hidden = true; return; }
+  box.hidden = false;
+  const totals = ls.domainTotals(d, doms.map((x) => x.key));
+  const body = $("dom-rows");
+  if (body.children.length !== doms.length || body.dataset.keys !== doms.map((x) => x.key).join()) {
+    body.dataset.keys = doms.map((x) => x.key).join();
+    body.replaceChildren(...doms.map((x, i) => {
+      const tr = document.createElement("tr");
+      const th = document.createElement("th");
+      th.scope = "row";
+      const sw = document.createElement("span");
+      sw.className = `dom-swatch ${x.key === "other" ? "so" : `s${i}`}`;
+      sw.setAttribute("aria-hidden", "true");
+      const name = document.createElement("span");
+      th.append(sw, name);
+      tr.append(th, ...[0, 1, 2, 3].map(() => document.createElement("td")));
+      return tr;
+    }));
+  }
+  doms.forEach((x, i) => {
+    const tr = body.children[i];
+    tr.firstChild.lastChild.textContent = x.label;
+    const t = totals[x.key];
+    const cells = [ls.fmtCount(x.sessionsActive), ...["h5", "d30", "all"].map((w) => (t[w] === null ? "–" : bytesText(t[w])))];
+    cells.forEach((v, k) => { if (tr.children[k + 1].textContent !== v) tr.children[k + 1].textContent = v; });
   });
 }
 
@@ -674,7 +783,9 @@ function svgEl(name, attrs = {}) {
 }
 
 function drawChart(slid) {
-  const w = lv.windows[lv.view];
+  const sp = split();
+  const keys = lv.keys[sp];
+  const w = lv.windows[sp][lv.view];
   const svg = $("chart-svg");
   const plot = $("chart-plot");
   const width = Math.max(200, plot.clientWidth);
@@ -685,8 +796,8 @@ function drawChart(slid) {
   $("chart-empty").hidden = !!hasData;
   if (!hasData || iw <= 0 || ih <= 0) { svg.replaceChildren(); lv.geom = null; return; }
 
-  const g = ls.stackGeometry(w, lv.sites, iw, ih);
-  lv.geom = { w, g, iw, ih, width, height };
+  const g = ls.stackGeometry(w, keys, iw, ih);
+  lv.geom = { w, g, keys, iw, ih, width, height };
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   svg.setAttribute("width", width);
   svg.setAttribute("height", height);
@@ -730,10 +841,10 @@ function drawChart(slid) {
   const clipped = svgEl("g", { "clip-path": "url(#chart-clip)", transform: `translate(${CH.left} ${CH.top})` });
   const bands = svgEl("g", { class: "chart-bands" });
   g.bands.forEach((b, i) => {
-    bands.append(svgEl("path", { d: b.area, class: `band-area s${i}` }));
+    bands.append(svgEl("path", { d: b.area, class: `band-area ${seriesClass(keys[i], i)}` }));
   });
   g.bands.forEach((b, i) => {
-    bands.append(svgEl("path", { d: b.line, class: `band-line s${i}` }));
+    bands.append(svgEl("path", { d: b.line, class: `band-line ${seriesClass(keys[i], i)}` }));
   });
   clipped.append(bands);
   frag.append(clipped);
@@ -741,7 +852,7 @@ function drawChart(slid) {
   // Hover layer: crosshair and a dot per band top.
   const hover = svgEl("g", { class: "chart-hover", transform: `translate(${CH.left} ${CH.top})`, visibility: "hidden" });
   hover.append(svgEl("line", { class: "chart-cross", x1: 0, x2: 0, y1: 0, y2: ih }));
-  lv.sites.forEach((_, i) => hover.append(svgEl("circle", { class: `chart-mark s${i}`, r: 4, cx: 0, cy: 0 })));
+  keys.forEach((k, i) => hover.append(svgEl("circle", { class: `chart-mark ${seriesClass(k, i)}`, r: 4, cx: 0, cy: 0 })));
   frag.append(hover);
 
   svg.replaceChildren(frag);
@@ -757,14 +868,14 @@ function drawChart(slid) {
 }
 
 function drawCaption() {
-  const w = lv.windows[lv.view];
+  const w = lv.windows[split()][lv.view];
   if (!w) return;
   let peak = 0;
   for (let i = 0; i < w.points; i++) peak = Math.max(peak, ls.totalAt(w, i) || 0);
   const last = ls.lastFilled(w);
   const now = last >= 0 ? ls.totalAt(w, last) : 0;
   const span = ls.VIEWS[lv.view].label;
-  setText("chart-caption", `Relay throughput by box over the last ${span}: latest ${rateText(now)}, peak ${rateText(peak)}.`);
+  setText("chart-caption", `Relay throughput by ${split()} over the last ${span}: latest ${rateText(now)}, peak ${rateText(peak)}.`);
   setText("chart-peak", peak > 0 ? `peak ${rateText(peak)}` : "");
 }
 
@@ -773,7 +884,7 @@ function drawHover(i) {
   const tip = $("chart-tip");
   const layer = $("chart-svg").querySelector(".chart-hover");
   if (!gm || !layer || i === null) { tip.hidden = true; if (layer) layer.setAttribute("visibility", "hidden"); return; }
-  const { w, g, iw } = gm;
+  const { w, g, keys } = gm;
   const total = ls.totalAt(w, i);
   if (total === null) { tip.hidden = true; layer.setAttribute("visibility", "hidden"); return; }
   const x = i * g.dx;
@@ -783,14 +894,14 @@ function drawHover(i) {
   cross.setAttribute("x2", x);
   let acc = 0;
   const marks = layer.querySelectorAll(".chart-mark");
-  lv.sites.forEach((s, k) => {
+  keys.forEach((s, k) => {
     acc += Number(w.values[s][i]) || 0;
     marks[k].setAttribute("cx", x);
     marks[k].setAttribute("cy", g.y(acc));
   });
 
   // Values lead, names follow; top band first, as the stack reads.
-  const rows = lv.sites.map((s, k) => ({ s, k, v: Number(w.values[s][i]) || 0 })).reverse();
+  const rows = keys.map((s, k) => ({ s, k, v: Number(w.values[s][i]) || 0 })).reverse();
   const head = document.createElement("p");
   head.className = "tip-head";
   const tt = document.createElement("strong");
@@ -801,13 +912,13 @@ function drawHover(i) {
   const list = document.createElement("ul");
   for (const r of rows) {
     const li = document.createElement("li");
-    li.className = `s${r.k}`;
+    li.className = seriesClass(r.s, r.k);
     const key = document.createElement("span");
     key.className = "tip-key";
     const v = document.createElement("strong");
     v.textContent = rateText(r.v);
     const name = document.createElement("span");
-    name.textContent = ls.siteCode(r.s);
+    name.textContent = seriesName(r.s);
     li.append(key, v, name);
     list.append(li);
   }
@@ -854,6 +965,30 @@ function setView(v) {
   drawChart(0);
   if (v !== "m10") pollHistory();
 }
+
+// By box or by domain. The switch shows once the collector sends domains.
+function drawSplit() {
+  const group = $("chart-split");
+  group.hidden = !lv.keys.domain.length;
+  const sp = split();
+  for (const b of group.querySelectorAll(".tab")) b.setAttribute("aria-pressed", b.dataset.split === sp ? "true" : "false");
+}
+
+function setSplit(sp) {
+  if (!SPLITS.includes(sp) || sp === split()) return;
+  lv.split = sp;
+  save(KEY_SPLIT, sp);
+  lv.hover = null;
+  drawSplit();
+  drawHover(null);
+  drawLegend();
+  drawChart(0);
+}
+
+$("chart-split").addEventListener("click", (e) => {
+  const b = e.target.closest(".tab");
+  if (b) setSplit(b.dataset.split);
+});
 
 $("chart-tabs").addEventListener("click", (e) => {
   const b = e.target.closest(".tab");

@@ -145,6 +145,10 @@
             <button type="button" role="tab" class="tab" data-view="h24" id="tab-h24" aria-selected="false" aria-controls="chart-plot" tabindex="-1">24 h</button>
             <button type="button" role="tab" class="tab" data-view="d7" id="tab-d7" aria-selected="false" aria-controls="chart-plot" tabindex="-1">7 days</button>
           </div>
+          <div class="tabs" role="group" aria-label="Split the graph" id="chart-split" hidden>
+            <button type="button" class="tab" data-split="box" aria-pressed="true">By box</button>
+            <button type="button" class="tab" data-split="domain" aria-pressed="false">By domain</button>
+          </div>
           <span class="chart-peak" id="chart-peak"></span>
         </div>
         <div class="chart-plot" id="chart-plot" role="tabpanel" aria-labelledby="tab-m10">
@@ -153,7 +157,7 @@
           <p class="chart-empty" id="chart-empty">Collecting the first samples…</p>
         </div>
         <figcaption class="sr-only" id="chart-caption">Relay throughput by box.</figcaption>
-        <ul class="sites" id="sites" aria-label="The five boxes, right now"></ul>
+        <ul class="sites" id="sites" aria-label="The boxes, right now"></ul>
       </figure>
 
       <div class="panels">
@@ -189,10 +193,17 @@
             <div><dt>Peak, 24 h</dt><dd id="g-peak">–</dd></div>
             <div><dt>byod domains</dt><dd id="g-byod">–</dd></div>
           </dl>
+          <table class="totals dom-totals" id="dom-totals" hidden>
+            <caption>By domain</caption>
+            <thead>
+              <tr><th scope="col"><span class="sr-only">Domain</span></th><th scope="col">Open</th><th scope="col">5 h</th><th scope="col">30 d</th><th scope="col">All time</th></tr>
+            </thead>
+            <tbody id="dom-rows"></tbody>
+          </table>
         </section>
       </div>
 
-      <p class="live-note" id="live-note">Counters only. No addresses are stored: distinct clients are counted with a salted hash, and your own numbers stay on your box for 24 hours. Your traffic is added up when each connection closes. Location by <a href="https://db-ip.com">DB-IP</a>.</p>
+      <p class="live-note" id="live-note">Counters only. No addresses are stored: distinct clients are counted with a salted hash, and your own numbers stay on your box for 24 hours. Your traffic is added up when each connection closes. By domain, each box splits its traffic by the sessions open on each domain, weighted by what that domain's finished sessions used, so those bytes are an estimate; session counts are exact. Location by <a href="https://db-ip.com">DB-IP</a>.</p>
     </section>
   </main>
 

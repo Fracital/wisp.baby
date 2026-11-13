@@ -243,6 +243,82 @@ export function liveSites(live) {
     }));
 }
 
+/** Colours on the by-domain graph: this many named domains, then everything else is "other". */
+export const MAX_DOMAINS = 5;
+
+const DOMAIN_KEY = /^[a-z0-9]{1,24}$/;
+
+/**
+ * The /live `domains`, cleaned: well-formed keys, a label (the collector's, else the key), the total
+ * rate and the open sessions. Past MAX_DOMAINS named ones, the rest fold into "other", which is
+ * always last. [] when the collector sends no domains (v1).
+ */
+export function liveDomains(live) {
+  if (!Array.isArray(live?.domains)) return [];
+  const named = [];
+  let other = null;
+  const seen = new Set();
+  for (const d of live.domains) {
+    if (!d || typeof d.key !== "string" || !DOMAIN_KEY.test(d.key) || seen.has(d.key)) continue;
+    seen.add(d.key);
+    const row = {
+      key: d.key,
+      label: typeof d.label === "string" && d.label.trim() ? d.label.trim().slice(0, 40) : d.key,
+      bps: (Number(d.downBps) || 0) + (Number(d.upBps) || 0),
+      sessionsActive: Number(d.sessionsActive) || 0,
+    };
+    if (row.key === "other") other = row;
+    else named.push(row);
+  }
+  for (const extra of named.splice(MAX_DOMAINS)) {
+    other ||= { key: "other", label: "Other", bps: 0, sessionsActive: 0 };
+    other.bps += extra.bps;
+    other.sessionsActive += extra.sessionsActive;
+  }
+  return other ? [...named, other] : named;
+}
+
+/**
+ * A series block keyed by `field` ("sites" or "domains") reshaped to `{ step, t0, sites }` over
+ * `keys`, the form windowFrom and mergeTail take. A domain series not in `keys` is added to "other"
+ * when "other" is one of them. null when the block has no such field.
+ */
+export function seriesBlock(block, field, keys) {
+  const src = block?.[field];
+  if (!src || typeof src !== "object") return null;
+  const out = {};
+  const want = new Set(keys);
+  for (const k of keys) if (Array.isArray(src[k])) out[k] = src[k].slice();
+  if (want.has("other")) {
+    for (const [k, arr] of Object.entries(src)) {
+      if (want.has(k) || !Array.isArray(arr)) continue;
+      const acc = out.other || (out.other = arr.map(() => 0));
+      arr.forEach((v, i) => { acc[i] = (Number(acc[i]) || 0) + (Number(v) || 0); });
+    }
+  }
+  return { step: block.step, t0: block.t0, sites: out };
+}
+
+/**
+ * Per-domain totals for the table: for each key, bytes over h5/d30/all, with domains beyond `keys`
+ * added to "other" when it is listed. Missing numbers stay null.
+ */
+export function domainTotals(live, keys) {
+  const src = live?.domainTotals && typeof live.domainTotals === "object" ? live.domainTotals : {};
+  const out = Object.fromEntries(keys.map((k) => [k, { h5: null, d30: null, all: null }]));
+  const add = (k, t) => {
+    for (const w of ["h5", "d30", "all"]) {
+      const b = Number(t?.[w]?.bytes);
+      if (Number.isFinite(b)) out[k][w] = (out[k][w] || 0) + b;
+    }
+  };
+  for (const [k, t] of Object.entries(src)) {
+    if (out[k]) add(k, t);
+    else if (out.other && DOMAIN_KEY.test(k)) add("other", t);
+  }
+  return out;
+}
+
 /** How old the payload is, by the box's clock (served − ts), in ms; Infinity when unknown. */
 export function liveAge(live) {
   const a = Number(live?.served) - Number(live?.ts);

@@ -11,7 +11,8 @@ http://127.0.0.1:8080  the page (site/), GET /where (dev JSON), the same
                        ws://127.0.0.1:* (the dev holyWisp). GET /live, /live/history and /you
                        answer with made-up but moving numbers for five fake boxes (README.md
                        "Live stats"); the dev speed test's own bytes show up in them.
-                       --no-live makes them 503, like a box whose stats are down.
+                       --no-live makes them 503, like a box whose stats are down;
+                       --no-domains leaves out the by-domain fields, like a v1 collector.
 http://127.0.0.1:8081  the speed test endpoint the boxes serve on :80 (README.md
                        "Server"): GET /speedtest/range/A-B sends B-A+1 random bytes (at most
                        26214400), POST reads and drops the body (Content-Length required) and
@@ -53,8 +54,13 @@ class FakeStats:
 
     SITES = [("iev", "Kyiv", "UA", 0.9e9), ("mia", "Miami", "US", 2.6e9), ("jnb", "Johannesburg", "ZA", 0.5e9),
              ("ams", "Amsterdam", "NL", 1.8e9), ("mnz", "Manassas", "US", 3.1e9)]
+    # The domain tags and the neutral labels the collector uses by default, with each one's share of
+    # the traffic (they add up to 1). The dev speed test's bytes go to wisp.baby.
+    DOMAINS = [("wispbaby", "wisp.baby", 0.08), ("abstract", "Abstract", 0.48), ("fracital", "Fracital", 0.36),
+               ("stomp", "STomp", 0.06), ("other", "Other", 0.02)]
     STEP = 2000
     enabled = True
+    domains_on = True
 
     def __init__(self):
         self.start = time.time()
@@ -83,27 +89,42 @@ class FakeStats:
             return 0
         return (nxt[1] - prev[1]) * 8000 / (nxt[0] - prev[0])
 
-    def rate(self, i, t):
+    def base_rate(self, i, t):
         base = self.SITES[i][3]
         hours = t / 3.6e6
         day = 0.55 + 0.45 * math.sin(2 * math.pi * (hours / 24 + i * 0.17))
         wob = 1 + 0.12 * math.sin(t / 37000 + i) + 0.07 * math.sin(t / 9100 + 2 * i)
-        v = max(0.0, base * day * wob)
+        return max(0.0, base * day * wob)
+
+    def rate(self, i, t):
+        v = self.base_rate(i, t)
         if i == 0:
+            v += self.test_bps(t)
+        return int(v)
+
+    def domain_rate(self, k, t):
+        # The whole fleet's traffic times the domain's share, the shares drifting a little.
+        key, _label, share = self.DOMAINS[k]
+        drift = 1 + 0.25 * math.sin(t / 61000 + 3 * k)
+        v = sum(self.base_rate(i, t) for i in range(len(self.SITES))) * share * drift
+        if key == "wispbaby":
             v += self.test_bps(t)
         return int(v)
 
     def series(self, step, points, end):
         end = end - end % step
         t0 = end - (points - 1) * step
-        sites = {}
-        for i, (name, *_rest) in enumerate(self.SITES):
+        def sample(fn):
             if step == self.STEP:
-                sites[name] = [self.rate(i, t0 + k * step) for k in range(points)]
-            else:  # an average over the bucket, from four samples
-                sites[name] = [int(sum(self.rate(i, t0 + k * step + j * step / 4) for j in range(4)) / 4)
-                               for k in range(points)]
-        return {"step": step, "t0": t0, "sites": sites}
+                return [fn(t0 + k * step) for k in range(points)]
+            # an average over the bucket, from four samples
+            return [int(sum(fn(t0 + k * step + j * step / 4) for j in range(4)) / 4) for k in range(points)]
+        sites = {name: sample(lambda t, i=i: self.rate(i, t)) for i, (name, *_rest) in enumerate(self.SITES)}
+        domains = {key: sample(lambda t, k=k: self.domain_rate(k, t)) for k, (key, *_rest) in enumerate(self.DOMAINS)}
+        return {"step": step, "t0": t0, "sites": sites, "domains": domains}
+
+    def domain_labels(self):
+        return [{"key": key, "label": label} for key, label, _ in self.DOMAINS]
 
     def live(self):
         self.mark()
@@ -114,8 +135,18 @@ class FakeStats:
         sites = [{"site": n, "city": c, "country": cc, "up": True, "downBps": int(last[n] * 0.93),
                   "upBps": int(last[n] * 0.07), "sessionsActive": int(last[n] / 4.2e6)}
                  for n, c, cc, _ in self.SITES]
+        lastd = {key: tail["domains"][key][-1] for key, *_ in self.DOMAINS}
+        sess = int(total / 4.2e6)
+        domains = [{"key": key, "label": label, "downBps": int(lastd[key] * 0.93), "upBps": int(lastd[key] * 0.07),
+                    "sessionsActive": int(sess * share)} for key, label, share in self.DOMAINS]
+        alltime = 519e12 + self.test_bytes
+        dom_totals = {key: {"h5": {"bytes": int(4.1e12 * share), "sessions": int(15611 * share)},
+                            "d7": {"bytes": int(130e12 * share), "sessions": int(495372 * share)},
+                            "d30": {"bytes": int(512e12 * share), "sessions": int(1688441 * share)},
+                            "all": {"bytes": int(alltime * share), "sessions": int(1701045 * share)}}
+                      for key, _label, share in self.DOMAINS}
         gb = 1e9
-        return {
+        return self.v1({
             "served": now, "stale": False, "v": 1, "ts": tail["t0"] + 29 * self.STEP,
             "now": {"downBps": int(total * 0.93), "upBps": int(total * 0.07),
                     "sessionsActive": int(total / 4.2e6), "streamsActive": int(total / 0.9e6)},
@@ -130,13 +161,26 @@ class FakeStats:
             "clients": {"today": 3121, "d30": 47672, "ipDays30": 61204},
             "byodDomains": 37,
             "sites": sites,
+            "domains": domains,
+            "domainTotals": dom_totals,
             "tail": tail,
-        }
+        })
+
+    def v1(self, d):
+        # --no-domains: what a v1 collector sends.
+        if not self.domains_on:
+            for k in ("domains", "domainTotals", "domainLabels"):
+                d.pop(k, None)
+            for block in d.values():
+                if isinstance(block, dict):
+                    block.pop("domains", None)
+        return d
 
     def history(self):
         now = int(time.time() * 1000)
-        return {"v": 1, "ts": now, "m10": self.series(self.STEP, 300, now),
-                "h24": self.series(300000, 288, now), "d7": self.series(3600000, 168, now)}
+        return self.v1({"v": 1, "ts": now, "m10": self.series(self.STEP, 300, now),
+                        "h24": self.series(300000, 288, now), "d7": self.series(3600000, 168, now),
+                        "domainLabels": self.domain_labels()})
 
     def you(self, addr):
         return {"v": 1, "ip": addr, "city": "Localhost", "country": "--", "site": "mnz", "rttMs": 0.1,
@@ -286,8 +330,10 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--speed-port", type=int, default=8081)
     ap.add_argument("--no-live", action="store_true", help="answer /live, /live/history and /you with 503")
+    ap.add_argument("--no-domains", action="store_true", help="leave the by-domain fields out of /live and /live/history")
     args = ap.parse_args()
     FakeStats.enabled = not args.no_live
+    FakeStats.domains_on = not args.no_domains
 
     if not os.path.isdir(SITE):
         sys.exit("serve.py: %s does not exist (site/)" % SITE)

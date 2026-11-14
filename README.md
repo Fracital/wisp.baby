@@ -168,7 +168,11 @@ counted on their own.
 
 By domain: every relay route tags its sessions with the organization whose domain they came in on:
 Abstract (abulxt's byod names), Fracital (Fracital's names and holywisp.fracit.al), STomp
-(stomp.fracit.al), wisp.baby for wisp.baby's own relay and speed test, and "other" for the rest. Sessions per domain are exact. Bytes per domain are an
+(stomp.fracit.al), wisp.baby for wisp.baby's own relay and speed test, and "other" for the rest. STomp
+only counts as STomp because its relay URL is on its own name: `STOMP_WISP_URL=wss://stomp.fracit.al/pipe/<Fracital
+gate key>/` in terp's `/opt/stomp/repo/.env` (since 2026-11-14; on `wss://holywisp.fracit.al/` it counted as
+Fracital). "other" also takes bytes that arrive while no tagged session is open, such as those of sockets opened
+before an OpenResty reload. Sessions per domain are exact. Bytes per domain are an
 estimate, because holyWisp only counts bytes box-wide and a WebSocket's own byte count is only known
 when it closes. So each box splits every 2 s of its traffic across the domains by their open
 sessions, weighted by the bytes per second of each domain's recently finished sessions. The domains

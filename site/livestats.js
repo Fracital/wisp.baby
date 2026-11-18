@@ -186,8 +186,9 @@ export function timeTicks(view, w, fmt) {
 /**
  * Paths for a stacked area chart of the window, `sites` bottom to top, in a width × height box
  * (y down). Returns { yMax, ticks, dx, y, from, bands: [{ site, area, line }] }: `area` is a
- * closed path between the band's floor and top, `line` its top edge. Drawing starts at `from`, the
- * first slot with data; after it, a slot with no data counts as 0.
+ * closed path between the band's floor and top, `line` its top edge where the band is not zero
+ * ("" for a band that is zero throughout). Drawing starts at `from`, the first slot with data; after
+ * it, a slot with no data counts as 0.
  */
 export function stackGeometry(w, sites, width, height, { minMax = 1e6 } = {}) {
   const n = w.points;
@@ -209,12 +210,22 @@ export function stackGeometry(w, sites, width, height, { minMax = 1e6 } = {}) {
   const f = (v) => (Math.round(v * 10) / 10).toString();
   for (const s of sites) {
     const vals = w.values[s] || [];
-    const top = floor.map((b, i) => b + (Number(vals[i]) || 0));
+    const v = (i) => Number(vals[i]) || 0;
+    const top = floor.map((b, i) => b + v(i));
+    let edge = "";
+    for (let i = from; i < n; i++) edge += `${i > from ? "L" : "M"}${f(x(i))} ${f(y(top[i]))}`;
+    // The stroke only where the band has height: a zero band's top is the band below's top, and
+    // stroking it there paints this colour over that one (an idle "other" was a grey rule).
     let line = "";
-    for (let i = from; i < n; i++) line += `${i > from ? "L" : "M"}${f(x(i))} ${f(y(top[i]))}`;
+    let pen = false;
+    for (let i = from; i < n; i++) {
+      const on = v(i) > 0 || (i > from && v(i - 1) > 0) || (i < n - 1 && v(i + 1) > 0);
+      if (on) line += `${pen ? "L" : "M"}${f(x(i))} ${f(y(top[i]))}`;
+      pen = on && (v(i) > 0 || (i < n - 1 && v(i + 1) > 0));
+    }
     let back = "";
     for (let i = n - 1; i >= from; i--) back += `L${f(x(i))} ${f(y(floor[i]))}`;
-    bands.push({ site: s, area: `${line}${back}Z`, line });
+    bands.push({ site: s, area: `${edge}${back}Z`, line });
     for (let i = 0; i < n; i++) floor[i] = top[i];
   }
   return { yMax: max, ticks, dx, bands, y, from };

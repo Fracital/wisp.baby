@@ -895,9 +895,12 @@ function drawHover(i) {
   let acc = 0;
   const marks = layer.querySelectorAll(".chart-mark");
   keys.forEach((s, k) => {
-    acc += Number(w.values[s][i]) || 0;
+    const v = Number(w.values[s][i]) || 0;
+    acc += v;
     marks[k].setAttribute("cx", x);
     marks[k].setAttribute("cy", g.y(acc));
+    // A zero band has no top of its own: its dot would sit on the band below's.
+    marks[k].setAttribute("visibility", v > 0 ? "inherit" : "hidden");
   });
 
   // Values lead, names follow; top band first, as the stack reads.

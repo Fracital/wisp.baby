@@ -97,6 +97,25 @@ test("stackGeometry stacks bands bottom to top and skips the empty start", () =>
   assert.equal(ls.slotAt(999, 300, 4), 3);
 });
 
+test("stackGeometry strokes a band only where it has height", () => {
+  const w = ls.emptyWindow(2000, 5, 8000, ["a", "other"]);
+  w.values.a = [1e9, 1e9, 1e9, 1e9, 1e9];
+  // Zero throughout: no line, so it can't paint over a's top edge.
+  w.values.other = [0, 0, 0, 0, 0];
+  let g = ls.stackGeometry(w, ["a", "other"], 400, 100, { minMax: 0 });
+  assert.equal(g.bands[1].line, "");
+  assert.match(g.bands[1].area, /^M0 0L100 0/);
+  assert.match(g.bands[0].line, /^M0 0L100 0L200 0L300 0L400 0$/);
+  // Non-zero at slot 2 only: the rise and fall around it, nothing over the flat parts.
+  w.values.other = [0, 0, 1e9, 0, 0];
+  g = ls.stackGeometry(w, ["a", "other"], 400, 100, { minMax: 0 });
+  assert.match(g.bands[1].line, /^M100 50L200 0L300 50$/);
+  // Two separate bumps: two subpaths.
+  w.values.other = [1e9, 0, 0, 0, 1e9];
+  g = ls.stackGeometry(w, ["a", "other"], 400, 100, { minMax: 0 });
+  assert.match(g.bands[1].line, /^M0 0L100 50M300 50L400 0$/);
+});
+
 test("timeTicks: relative labels for 10 min, local hours and days for the long views", () => {
   const m10 = ls.timeTicks("m10", ls.emptyWindow(2000, 300, Date.now(), ["a"]), () => "x");
   assert.deepEqual(m10.map((t) => t.label), ["10 min ago", "5 min ago", "now"]);

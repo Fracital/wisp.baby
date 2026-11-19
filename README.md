@@ -18,7 +18,7 @@ It is a small static page with no build step.
 | `site/favicon.svg` | Icon. |
 | `dev/serve.py` | Local harness: serves `site/`, `/where`, made-up `/live`, `/live/history` and `/you`, `/speedtest/range/*`, and points the page at a local holyWisp. |
 | `dev/run-holywisp.sh` | Fetches holyWisp from npm (integrity checked) and runs it on `ws://127.0.0.1:6011/` with a dev config; `HOLYWISP_BIN=<local build>` runs that instead, with its WebTransport listener on. |
-| `test/` | `node --test 'test/*.test.mjs'`. The end-to-end tests run only with `HOLYWISP_BIN` set: `e2e.test.mjs` drives the engine in Node (WebSocket), `browser.test.mjs` the page in headless Chrome (WebTransport, WebSocket, the fallback). |
+| `test/` | `node --test 'test/*.test.mjs'`. The end-to-end tests run only with `HOLYWISP_BIN` set: `e2e.test.mjs` drives the engine in Node (WebSocket), `browser.test.mjs` the page in headless Chrome (WebTransport with no WebSocket at all, WebSocket, the fallback after two sessions; with `E2E_NETFLIX=1` also Netflix mode over WebTransport). |
 
 Each box serves `site/` from `/var/www/wispbaby/`.
 
@@ -114,13 +114,17 @@ Transport (decided once per run, before the download, and never mixed within a r
 - `webtransport`: a session to `webtransport.url`; the run fails (`error`, phase `servers`) if the
   browser has no `WebTransport`, there is no listener, or the first session does not open in 10 s.
 - `auto`: WebTransport when the browser has `WebTransport` and `webtransport` names a listener,
-  else WebSocket. The first session is opened before the download; if it fails or has not
-  delivered its stream-0 CONTINUE within 3 s, the whole run goes over WebSocket and the `transport`
-  event says why. The page remembers such a failure for an hour (`localStorage`, when it may) and
-  skips WebTransport meanwhile; `?transport=` ignores that.
+  else WebSocket. The first session is opened before anything else; if it fails or has not
+  delivered its stream-0 CONTINUE within 3 s, a second, fresh session gets another 3 s (starting
+  at least 0.5 s after the first gave up), and only if that one fails too does the whole run go
+  over WebSocket, with the `transport` event saying why. Every run tries again from the start:
+  nothing about a failure is remembered.
 
-Netflix mode's one `api.fast.com` call (libcurl.js) always goes over the WebSocket; its downloads
-and uploads use the run's transport.
+Netflix mode's one `api.fast.com` call (libcurl.js) uses the run's transport, like its downloads
+and uploads. Over WebTransport, libcurl gets a custom transport (`libcurlTransport`): every TCP
+connection it makes is a Wisp stream on one of the run's sessions (an idle one, else one a worker
+holds; never a new one, so a mid-run refresh of the list opens nothing), and the run creates no
+WebSocket at all. Over WebSocket, libcurl opens its own Wisp WebSocket to `wispUrl`.
 
 Events (every payload is a plain object):
 - `phase` `{ phase: "servers" | "download" | "latency" | "upload" | "done" }`

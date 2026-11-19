@@ -41,13 +41,17 @@ export const MAX_DATA_PAYLOAD = 262144;
 const UPLOAD_CHUNK = 32768;
 const MAX_BUFFERED = 4 * 1024 * 1024;
 
-// WebTransport: how long `auto` waits for the session and its stream-0 CONTINUE before it runs the
-// test over WebSocket instead (a network that drops UDP never answers; on one that carries it the
-// QUIC handshake is one round trip). An explicit `transport: "webtransport"` waits as long as a
-// WebSocket handshake. A Wisp packet on the session's stream is at most this long (holyWisp sends
-// at most 128 KiB of payload per packet); a longer length prefix is a broken stream.
+// WebTransport: how long `auto` waits for a session and its stream-0 CONTINUE (a network that drops
+// UDP never answers; on one that carries it the QUIC handshake is one round trip). If the first
+// session does not open, `auto` tries one more, fresh, no sooner than WT_RETRY_GAP_MS after the
+// first gave up (a relay that is restarting refuses at once), and only then runs the test over
+// WebSocket: at worst 3 s + 3 s. An explicit `transport: "webtransport"` waits as long as a
+// WebSocket handshake, once. A Wisp packet on the session's stream is at most this long (holyWisp
+// sends at most 128 KiB of payload per packet); a longer length prefix is a broken stream.
 export const TRANSPORTS = ["auto", "webtransport", "websocket"];
 const WT_AUTO_TIMEOUT_MS = 3000;
+const WT_AUTO_ATTEMPTS = 2;
+const WT_RETRY_GAP_MS = 500;
 const HANDSHAKE_TIMEOUT_MS = 10000;
 const WT_MAX_PACKET = 16 * 1024 * 1024;
 
@@ -837,6 +841,25 @@ export class WispPool {
     return conn;
   }
 
+  /**
+   * An open connection to put one short-lived stream on, without leasing it: an idle one, else one a
+   * worker holds (Wisp multiplexes; the worker keeps it), else one still opening. Opens one only
+   * when the pool has none at all. Netflix mode's api.fast.com call uses this over WebTransport, so
+   * a mid-run refresh of the server list never opens a session under load.
+   */
+  async shared() {
+    if (this.closed) throw new Error("stopped");
+    this._prune();
+    const idle = this.idle.find((e) => e.conn.ready);
+    if (idle) return idle.conn;
+    const leased = [...this.all].find((c) => c.ready && !c.closed);
+    if (leased) return leased;
+    if (!this.idle.length) this.idle.push(this._open());
+    const conn = await this.idle[0].opened;
+    if (this.closed) throw new Error("stopped");
+    return conn;
+  }
+
   /** Give a leased connection back (its streams already closed). A closed one is dropped. */
   release(conn) {
     if (this.closed || conn.closed) {
@@ -1425,6 +1448,94 @@ export function loadLibcurl(base = LIBCURL_BASE, { fetch: fetchImpl = globalThis
   return p;
 }
 
+/**
+ * A libcurl.js custom transport (`libcurl.transport = <class>`) that carries each TCP connection
+ * libcurl makes as one Wisp stream on a connection the run already has, so a WebTransport run's
+ * api.fast.com call opens no WebSocket. `getConn()` returns (a promise of) an open WtConnection
+ * (or any Wisp connection); the stream honours its CONTINUE window like every other.
+ *
+ * libcurl.js (0.7.4, its emscripten SOCKFS) does `new transport(url)` for every TCP connect, where
+ * url is the set_websocket URL with `host:port` appended (no brackets around an IPv6 literal), sets
+ * `binaryType = "arraybuffer"`, assigns onopen/onmessage/onclose/onerror, compares `readyState`
+ * with the instance's CONNECTING/OPEN/CLOSING/CLOSED, calls send(ArrayBuffer) only while OPEN, and
+ * close(). That is what this class provides, and nothing more.
+ */
+export function libcurlTransport(getConn) {
+  const CONNECTING = 0;
+  const OPEN = 1;
+  const CLOSING = 2;
+  const CLOSED = 3;
+  return class WispOverSession {
+    static CONNECTING = CONNECTING;
+    static OPEN = OPEN;
+    static CLOSING = CLOSING;
+    static CLOSED = CLOSED;
+
+    constructor(url) {
+      this.url = url;
+      this.binaryType = "blob";
+      this.protocol = "";
+      this.extensions = "";
+      this.bufferedAmount = 0;
+      this.readyState = CONNECTING;
+      this.CONNECTING = CONNECTING;
+      this.OPEN = OPEN;
+      this.CLOSING = CLOSING;
+      this.CLOSED = CLOSED;
+      this.onopen = this.onmessage = this.onclose = this.onerror = null;
+      this.stream = null;
+      const m = /([^/]*):(\d+)$/.exec(url);
+      const host = m ? m[1].replace(/^\[(.*)\]$/, "$1") : "";
+      const port = m ? Number(m[2]) : 0;
+      if (!host || !(port > 0 && port < 65536)) throw new SyntaxError(`libcurl transport: no host:port in ${url}`);
+      Promise.resolve()
+        .then(() => getConn())
+        .then((conn) => {
+          if (this.readyState !== CONNECTING) return;
+          const s = conn.createStream(host, port);
+          this.stream = s;
+          s.ondata = (u8) => {
+            if (this.readyState === OPEN) this._fire("onmessage", { data: u8.slice().buffer });
+          };
+          s.onclose = (reason) => this._end(reason !== CLOSE_VOLUNTARY);
+          this.readyState = OPEN;
+          this._fire("onopen", {});
+        })
+        .catch(() => this._end(true));
+    }
+
+    send(data) {
+      if (this.readyState === CONNECTING) throw new DOMException("still connecting", "InvalidStateError");
+      if (this.readyState !== OPEN) return;
+      const u8 = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      for (let off = 0; off < u8.length; off += MAX_DATA_PAYLOAD) {
+        this.stream.write(u8.subarray(off, Math.min(off + MAX_DATA_PAYLOAD, u8.length)));
+      }
+    }
+
+    close() {
+      if (this.readyState === CLOSED || this.readyState === CLOSING) return;
+      this.readyState = CLOSING;
+      if (this.stream) this.stream.close();
+      setTimeout(() => this._end(false), 0);
+    }
+
+    /** The stream is gone: CLOSED, an error event first if it did not end cleanly, then close (once). */
+    _end(failed) {
+      if (this.readyState === CLOSED) return;
+      this.readyState = CLOSED;
+      if (this.stream && this.stream.open) this.stream.close();
+      if (failed) this._fire("onerror", {});
+      this._fire("onclose", { code: failed ? 1006 : 1000, reason: "", wasClean: !failed });
+    }
+
+    _fire(name, ev) {
+      const fn = this[name];
+      if (typeof fn === "function") fn.call(this, { type: name.slice(2), target: this, ...ev });
+    }
+  };
+}
+
 /** Turn an api.fast.com v2 answer into test servers. */
 export function netflixTargets(json) {
   const out = [];
@@ -1811,7 +1922,8 @@ export function createSpeedtest(options = {}) {
     WebTransport: options.WebTransport || globalThis.WebTransport,
     now: options.now || (() => performance.now()),
     pool: null,   // the run's connections, made once the transport is chosen
-    probe: null,  // the first WebTransport session while it opens
+    transport: null,  // "webtransport" | "websocket", once chosen
+    probe: null,  // a WebTransport session while chooseTransport waits for it to open
   };
 
   const listeners = new Map();
@@ -1834,8 +1946,15 @@ export function createSpeedtest(options = {}) {
     }
   }
 
+  // Netflix mode's one api.fast.com call (and a mid-run refresh of it). Over WebTransport, every
+  // TCP connection libcurl makes is a Wisp stream on one of the run's sessions (libcurlTransport,
+  // WispPool.shared), so the run opens no WebSocket at all; over WebSocket libcurl opens its own
+  // Wisp WebSocket to the relay, as it always has. The transport is chosen before this runs.
   async function fetchNetflixTargets() {
     const libcurl = options.libcurl || (await loadLibcurl(opts.libcurlBase, { fetch: options.fetch }));
+    if (stopped) throw new Error("stopped");
+    const pool = ctx.pool;
+    libcurl.transport = ctx.transport === "webtransport" ? libcurlTransport(() => pool.shared()) : "wisp";
     libcurl.set_websocket(opts.wispUrl);
     // A session of its own, closed once the answer is read: libcurl's default pool would keep the
     // TLS connection to api.fast.com (a Wisp stream) open for the rest of the page's life.
@@ -1870,12 +1989,14 @@ export function createSpeedtest(options = {}) {
   /**
    * Choose the run's transport and make its pool (README "Engine", `transport`). WebTransport needs
    * the constructor and a listener (opts.webtransport); its first session is opened here, before
-   * any load, and proves the path: if it does not open, `auto` runs the whole test over WebSocket
-   * and says why in `fallback`, `webtransport` fails the run. The run never mixes the two.
+   * any load, and proves the path. `auto` gives it two tries, each a fresh session of 3 s; if
+   * neither opens, the whole test runs over WebSocket and `fallback` says why. `webtransport` gives
+   * it one of 10 s and fails the run. The run never mixes the two.
    */
   async function chooseTransport() {
     const ws = (fallback = null) => {
       ctx.pool = new WispPool(opts.wispUrl, { WebSocket: ctx.WebSocket });
+      ctx.transport = "websocket";
       return { transport: "websocket", url: opts.wispUrl, fallback };
     };
     const wt = opts.webtransport;
@@ -1888,26 +2009,37 @@ export function createSpeedtest(options = {}) {
       return ws();
     }
     const connect = () => new WtConnection(wt.url, { WebTransport: WT, hashes: wt.hashes });
-    const first = connect();
-    ctx.probe = first;
-    try {
-      await first.open(transport === "auto" ? WT_AUTO_TIMEOUT_MS : HANDSHAKE_TIMEOUT_MS);
-    } catch (e) {
-      first.close();
-      if (stopped) return null;
-      const why = (e && e.message) || String(e);
-      if (transport === "webtransport") throw new Error(`WebTransport to ${wt.url}: ${why}`);
-      return ws(why);
-    } finally {
-      ctx.probe = null;
+    const auto = transport === "auto";
+    const tries = auto ? WT_AUTO_ATTEMPTS : 1;
+    const why = [];
+    for (let i = 0; i < tries; i++) {
+      if (i > 0) {
+        await new Promise((r) => setTimeout(r, WT_RETRY_GAP_MS));
+        if (stopped) return null;
+      }
+      const conn = connect();
+      ctx.probe = conn;
+      try {
+        await conn.open(auto ? WT_AUTO_TIMEOUT_MS : HANDSHAKE_TIMEOUT_MS);
+      } catch (e) {
+        conn.close();
+        if (stopped) return null;
+        why.push((e && e.message) || String(e));
+        continue;
+      } finally {
+        ctx.probe = null;
+      }
+      if (stopped) {
+        conn.close();
+        return null;
+      }
+      ctx.pool = new WispPool(wt.url, { connect });
+      ctx.pool.adopt(conn);
+      ctx.transport = "webtransport";
+      return { transport: "webtransport", url: wt.url, fallback: null };
     }
-    if (stopped) {
-      first.close();
-      return null;
-    }
-    ctx.pool = new WispPool(wt.url, { connect });
-    ctx.pool.adopt(first);
-    return { transport: "webtransport", url: wt.url, fallback: null };
+    if (!auto) throw new Error(`WebTransport to ${wt.url}: ${why[0]}`);
+    return ws(why.every((w) => w === why[0]) ? `${why[0]} (${why.length} tries)` : why.join("; then "));
   }
 
   function phaseTest(type, getter, onProgress) {
@@ -1922,6 +2054,9 @@ export function createSpeedtest(options = {}) {
     let phase = "servers";
     try {
       emit("phase", { phase });
+      // The transport first: Netflix mode's server list is fetched over it (fetchNetflixTargets).
+      const via = await chooseTransport();
+      if (!via || stopped) return null;
       const { targets, refresh } = await getTargets();
       if (stopped) return null;
       emit("servers", {
@@ -1929,8 +2064,6 @@ export function createSpeedtest(options = {}) {
         targets: targets.map((t) => ({ label: t.label, addr: t.addr })),
       });
       const getter = new UrlGetter(targets, refresh, ctx.now);
-      const via = await chooseTransport();
-      if (!via || stopped) return null;
       emit("transport", via);
       if (stopped) return null;
       // Every connection the run will use, opened now, before any load (WispPool says why). The

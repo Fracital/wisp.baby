@@ -21,6 +21,7 @@ import {
   HttpConnection,
   makeTarget,
   netflixTargets,
+  libcurlTransport,
   MAX_DATA_PAYLOAD,
 } from "../site/speedtest.js";
 
@@ -186,7 +187,7 @@ test("makeTarget / netflixTargets", () => {
  * WINDOW after every WINDOW DATA packets it got, and records any packet sent beyond the window.
  */
 function fakeWispFactory({ window = 4, closeEvery = 0 } = {}) {
-  const stats = { violations: 0, dataPackets: 0, uploaded: 0, connects: 0, requests: 0 };
+  const stats = { violations: 0, dataPackets: 0, uploaded: 0, connects: 0, requests: 0, targets: [] };
   class FakeWS {
     constructor(url, proto) {
       assert.equal(proto, undefined, "no subprotocol (Wisp v1)");
@@ -208,6 +209,7 @@ function fakeWispFactory({ window = 4, closeEvery = 0 } = {}) {
       const p = decodePacket(new Uint8Array(bytes).slice());
       if (p.type === PACKET.CONNECT) {
         stats.connects++;
+        stats.targets.push(`${p.hostname}:${p.port}`);
         this.streams.set(p.streamId, { window, got: 0, buf: "", need: -1, served: 0 });
       } else if (p.type === PACKET.DATA) {
         const s = this.streams.get(p.streamId);
@@ -371,9 +373,9 @@ test("WispPool: warm opens up front, leases are exclusive and reused, closed one
  * random (seeded) into reads of 1 byte to 3 KiB, so packets straddle reads and reads hold several
  * packets. A write resolves `writeDelay` ms after the fake took it (bytes in the browser's network
  * stack); `stats.resolvedData` is the DATA payload of resolved writes. `mode`: "ok", "refuse" (ready
- * and closed reject) or "hang" (ready never settles).
+ * and closed reject) or "hang" (ready never settles); `modes` sets it per session, in order.
  */
-function fakeWtFactory({ window = 4, writeDelay = 0, mode = "ok", closeEvery = 0 } = {}) {
+function fakeWtFactory({ window = 4, writeDelay = 0, mode = "ok", modes = null, closeEvery = 0 } = {}) {
   const { FakeWS, stats } = fakeWispFactory({ window, closeEvery });
   stats.sessions = [];
   stats.resolvedData = 0;
@@ -387,17 +389,19 @@ function fakeWtFactory({ window = 4, writeDelay = 0, mode = "ok", closeEvery = 0
     constructor(url, options = {}) {
       stats.sessions.push({ url, options });
       assert.equal(options.protocols, undefined, "no protocols (Wisp v1)");
+      // `modes`: one per session, in the order they are made (`mode` for any after them).
+      const m = (modes && modes[stats.sessions.length - 1]) || mode;
       this.url = url;
       this.closed = new Promise((res, rej) => {
         this._closedOk = res;
         this._closedErr = rej;
       });
       this.closed.catch(() => {});
-      if (mode === "refuse") {
+      if (m === "refuse") {
         this.ready = Promise.reject(new Error("refused"));
         this.ready.catch(() => {});
         setTimeout(() => this._closedErr(new Error("refused")), 0);
-      } else if (mode === "hang") {
+      } else if (m === "hang") {
         this.ready = new Promise(() => {});
       } else {
         this.ready = Promise.resolve();
@@ -662,11 +666,29 @@ test("engine: auto uses WebTransport when the listener answers", async () => {
   assert.deepEqual(r.events.filter((e) => e.name === "phase").map((e) => e.d.phase), ["servers"], "nothing after stop()");
 });
 
-test("engine: auto falls back to WebSocket when WebTransport fails, is missing or not offered", async () => {
-  const refused = await chooseWith({ transport: "auto", wt: fakeWtFactory({ mode: "refuse" }) });
+test("engine: auto falls back to WebSocket when WebTransport fails twice, is missing or not offered", async () => {
+  const wtRefused = fakeWtFactory({ mode: "refuse" });
+  const t0 = Date.now();
+  const refused = await chooseWith({ transport: "auto", wt: wtRefused });
   assert.equal(refused.via.transport, "websocket");
   assert.equal(refused.via.url, "ws://fake/");
-  assert.match(refused.via.fallback, /refused/);
+  assert.equal(refused.via.fallback, "refused (2 tries)");
+  assert.equal(wtRefused.stats.sessions.length, 2, "a second, fresh session before giving up");
+  assert.ok(Date.now() - t0 >= 450, "the retry waits a moment after a refusal");
+  // Two different reasons are both reported.
+  const { FakeWT: Refuse } = fakeWtFactory({ mode: "refuse" });
+  let made = 0;
+  class Mixed extends Refuse {
+    constructor(...a) {
+      super(...a);
+      if (++made === 2) {
+        this.ready = Promise.reject(new Error("no route"));
+        this.ready.catch(() => {});
+      }
+    }
+  }
+  const mixed = await chooseWith({ transport: "auto", WebTransport: Mixed });
+  assert.equal(mixed.via.fallback, "refused; then no route");
   const missing = await chooseWith({ transport: "auto", WebTransport: null });
   assert.deepEqual(missing.via, { transport: "websocket", url: "ws://fake/", fallback: null });
   const wt = fakeWtFactory();
@@ -675,15 +697,55 @@ test("engine: auto falls back to WebSocket when WebTransport fails, is missing o
   assert.equal(wt.stats.sessions.length, 0);
 });
 
+test("engine: auto retries a session that failed, and opens no WebSocket when the retry works", async () => {
+  const wt = fakeWtFactory({ modes: ["refuse", "ok"] });
+  const r = await chooseWith({ transport: "auto", wt });
+  assert.deepEqual(r.via, { transport: "webtransport", url: "https://fake-wt/", fallback: null });
+  assert.equal(wt.stats.sessions.length, 2);
+  assert.equal(r.wsMade(), 0);
+});
+
+test("engine: stop() while auto waits to retry opens nothing more", async () => {
+  const wt = fakeWtFactory({ mode: "refuse" });
+  const { FakeWS } = fakeWispFactory();
+  let wsMade = 0;
+  const st = createSpeedtest({
+    mode: "gcore",
+    wispUrl: "ws://fake/",
+    where: { addr: "198.51.100.9" },
+    webtransport: { url: "https://fake-wt/", hashes: [] },
+    WebTransport: wt.FakeWT,
+    WebSocket: class extends FakeWS {
+      constructor(...a) {
+        super(...a);
+        wsMade++;
+      }
+    },
+  });
+  const events = [];
+  for (const name of ["transport", "error", "servers"]) st.on(name, (d) => events.push(name));
+  const done = st.start();
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(wt.stats.sessions.length, 1);
+  st.stop();
+  assert.equal(await done, null);
+  await new Promise((r) => setTimeout(r, 700));
+  assert.equal(wt.stats.sessions.length, 1, "no second session after stop()");
+  assert.equal(wsMade, 0);
+  assert.deepEqual(events, []);
+});
+
 test("engine: transport websocket never opens WebTransport; webtransport never falls back", async () => {
   const wt = fakeWtFactory();
   const ws = await chooseWith({ transport: "websocket", wt });
   assert.equal(ws.via.transport, "websocket");
   assert.equal(wt.stats.sessions.length, 0);
-  const forced = await chooseWith({ transport: "webtransport", wt: fakeWtFactory({ mode: "refuse" }) });
+  const wtForced = fakeWtFactory({ mode: "refuse" });
+  const forced = await chooseWith({ transport: "webtransport", wt: wtForced });
   assert.equal(forced.error.phase, "servers");
   assert.match(forced.error.message, /WebTransport to https:\/\/fake-wt\/: .*refused/);
   assert.equal(forced.wsMade(), 0);
+  assert.equal(wtForced.stats.sessions.length, 1, "forced: one try of its own, no retry");
   const forcedNone = await chooseWith({ transport: "webtransport", WebTransport: null });
   assert.match(forcedNone.error.message, /no WebTransport/);
   assert.throws(() => createSpeedtest({ mode: "gcore", wispUrl: "ws://x/", transport: "quic" }), /unknown transport/);
@@ -704,4 +766,228 @@ test("WispPool over WebTransport: adopt, warm, exclusive leases", async () => {
   assert.ok(leases.every((c) => c instanceof WtConnection && c.ready));
   pool.close();
   assert.ok(leases.every((c) => c.closed));
+});
+
+test("WispPool.shared: an open connection without a lease, opening one only when there is none", async () => {
+  const { FakeWT, stats } = fakeWtFactory();
+  const connect = () => new WtConnection("https://fake/", { WebTransport: FakeWT });
+  const pool = new WispPool("https://fake/", { connect });
+  const a = await pool.shared();
+  assert.equal(stats.sessions.length, 1, "none at all: one is opened");
+  assert.ok(a.ready);
+  assert.equal(await pool.shared(), a, "idle and open: that one");
+  const leased = await pool.acquire();
+  assert.equal(leased, a);
+  assert.equal(await pool.shared(), a, "leased by a worker: shared anyway, nothing new opened");
+  assert.equal(stats.sessions.length, 1);
+  pool.close();
+  await assert.rejects(pool.shared(), /stopped/);
+});
+
+/**
+ * What libcurl.js 0.7.4's SOCKFS does with a custom transport for one TCP connection: construct it
+ * with `<set_websocket url><host>:<port>`, set binaryType, assign the four handlers, compare
+ * readyState with the instance's constants, send ArrayBuffers only while OPEN, close().
+ */
+function libcurlSocket(Transport, url) {
+  const ws = new Transport(url);
+  ws.binaryType = "arraybuffer";
+  const sock = { ws, events: [], data: [], opened: null, closed: null };
+  sock.opened = new Promise((ok) => (ws.onopen = () => (sock.events.push("open"), ok())));
+  sock.closed = new Promise((ok) => (ws.onclose = (ev) => (sock.events.push(`close ${ev.code}`), ok())));
+  ws.onerror = () => sock.events.push("error");
+  ws.onmessage = (ev) => {
+    assert.ok(ev.data instanceof ArrayBuffer);
+    sock.data.push(new Uint8Array(ev.data));
+  };
+  sock.send = (str) => {
+    if (ws.readyState === ws.CONNECTING) throw new Error("EAGAIN");
+    assert.equal(ws.readyState, ws.OPEN);
+    const u8 = typeof str === "string" ? enc.encode(str) : str;
+    ws.send(u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
+  };
+  sock.text = () => dec.decode(Buffer.concat(sock.data));
+  return sock;
+}
+
+test("libcurl transport: a TCP connection as one Wisp stream on the run's WebTransport session", async () => {
+  const { FakeWT, stats } = fakeWtFactory({ window: 4 });
+  const conn = new WtConnection("https://fake/", { WebTransport: FakeWT });
+  await conn.open();
+  let asked = 0;
+  const T = libcurlTransport(() => (asked++, conn));
+  assert.equal(T.OPEN, 1);
+  const s = libcurlSocket(T, "ws://fake/198.51.100.9:80");
+  assert.equal(s.ws.readyState, s.ws.CONNECTING);
+  assert.throws(() => s.send("x"), /EAGAIN/);
+  await s.opened;
+  assert.equal(asked, 1);
+  assert.deepEqual(stats.targets, ["198.51.100.9:80"]);
+  assert.equal(stats.sessions.length, 1, "no session of its own");
+  // A body bigger than one DATA packet, sent in one go: split, and only inside the window.
+  const body = new Uint8Array(MAX_DATA_PAYLOAD * 2 + 1000);
+  s.send(`POST /up HTTP/1.1\r\nHost: wisp.baby\r\nContent-Length: ${body.length}\r\n\r\n`);
+  s.send(body);
+  await waitUntil(() => s.text().includes("200 OK"));
+  assert.equal(stats.uploaded, body.length);
+  assert.equal(stats.violations, 0, "never past the CONTINUE window");
+  s.data.length = 0;
+  s.send("GET /r/0-99999 HTTP/1.1\r\nHost: wisp.baby\r\nAccept: */*\r\n\r\n");
+  await waitUntil(() => s.data.reduce((n, d) => n + d.length, 0) >= 100000);
+  assert.match(s.text(), /^HTTP\/1\.1 200 OK\r\nContent-Length: 100000\r\n/);
+  s.ws.close();
+  assert.equal(s.ws.readyState, s.ws.CLOSING);
+  await s.closed;
+  assert.equal(s.ws.readyState, s.ws.CLOSED);
+  assert.deepEqual(s.events, ["open", "close 1000"]);
+  assert.equal(conn.streams.size, 0, "the stream is closed with it");
+  assert.ok(!conn.closed, "the session stays");
+  conn.close();
+});
+
+test("libcurl transport: IPv6 targets, remote close, a lost session, no connection, bad URLs", async () => {
+  const { FakeWT, stats } = fakeWtFactory({ window: 4, closeEvery: 1 });
+  const conn = new WtConnection("https://fake/", { WebTransport: FakeWT });
+  await conn.open();
+  const T = libcurlTransport(async () => conn);
+  // The server ends the connection (CLOSE 0x02 after Connection: close): a clean close, no error.
+  const a = libcurlSocket(T, "wss://wisp.baby/2001:db8::7:443");
+  await a.opened;
+  assert.deepEqual(stats.targets, ["2001:db8::7:443"]);
+  a.send("GET /r/0-9 HTTP/1.1\r\nHost: wisp.baby\r\nAccept: */*\r\n\r\n");
+  await a.closed;
+  assert.match(a.text(), /Connection: close/);
+  assert.deepEqual(a.events, ["open", "close 1000"]);
+  // The session dies under an open stream: error, then close.
+  const b = libcurlSocket(T, "wss://wisp.baby/[2001:db8::8]:80");
+  await b.opened;
+  assert.equal(stats.targets[1], "2001:db8::8:80");
+  conn.close();
+  await b.closed;
+  assert.deepEqual(b.events, ["open", "error", "close 1006"]);
+  // No connection to be had: error, then close, never open.
+  const c = libcurlSocket(libcurlTransport(() => Promise.reject(new Error("stopped"))), "wss://wisp.baby/api.fast.com:443");
+  await c.closed;
+  assert.deepEqual(c.events, ["error", "close 1006"]);
+  // Closed while still connecting: nothing is opened later.
+  let late;
+  const d = libcurlSocket(libcurlTransport(() => new Promise((r) => (late = r))), "wss://wisp.baby/api.fast.com:443");
+  d.ws.close();
+  await d.closed;
+  const conn2 = new WtConnection("https://fake/", { WebTransport: FakeWT });
+  await conn2.open();
+  late(conn2);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(conn2.streams.size, 0);
+  assert.deepEqual(d.events, ["close 1000"]);
+  conn2.close();
+  assert.throws(() => new T("wss://wisp.baby/"), /host:port/);
+  assert.throws(() => new T("wss://wisp.baby/x:0"), /host:port/);
+});
+
+async function waitUntil(fn, ms = 2000) {
+  const end = Date.now() + ms;
+  while (!fn()) {
+    if (Date.now() > end) throw new Error("timed out");
+    await new Promise((r) => setTimeout(r, 2));
+  }
+}
+
+/**
+ * A stand-in for libcurl.js in Netflix mode: set_websocket, `transport`, HTTPSession with fetch and
+ * close. Its fetch makes one TCP connection to api.fast.com:443 the way libcurl does: through the
+ * custom transport when `transport` is a class (and speaks plain HTTP to the fake server, which
+ * answers anything), or through its own Wisp WebSocket to the set_websocket URL when it is "wisp".
+ */
+function fakeLibcurl(FakeWS) {
+  const lc = { transport: "wisp", websocketUrl: null, calls: [], sockets: 0 };
+  lc.set_websocket = (url) => (lc.websocketUrl = url);
+  const answer = { targets: [{ name: "oca", url: "http://198.51.100.20/speedtest?c=us", location: { city: "Testville", country: "US" } }] };
+  lc.HTTPSession = class {
+    async fetch(url) {
+      assert.equal(new URL(url).host, "api.fast.com");
+      lc.calls.push(typeof lc.transport === "function" ? "custom" : lc.transport);
+      if (typeof lc.transport === "function") {
+        const s = libcurlSocket(lc.transport, `${lc.websocketUrl}api.fast.com:443`);
+        await s.opened;
+        lc.sockets++;
+        s.send("GET /r/0-9 HTTP/1.1\r\nHost: wisp.baby\r\nAccept: */*\r\n\r\n");
+        await waitUntil(() => s.text().endsWith("\r\n\r\n" + "\0".repeat(10)));
+        s.ws.close();
+        await s.closed;
+      } else {
+        new FakeWS(lc.websocketUrl).close();  // libcurl's own Wisp WebSocket
+      }
+      return { ok: true, status: 200, json: async () => answer };
+    }
+    close() {}
+  };
+  return lc;
+}
+
+function netflixWith({ transport = "auto", wt, FakeWS }) {
+  let wsMade = 0;
+  class CountingWS extends FakeWS {
+    constructor(...a) {
+      super(...a);
+      wsMade++;
+    }
+  }
+  const libcurl = fakeLibcurl(CountingWS);
+  const st = createSpeedtest({
+    mode: "netflix",
+    wispUrl: "wss://wisp.baby/",
+    where: { host: "test" },
+    connections: { min: 1, max: 3 },
+    transport,
+    webtransport: { url: "https://fake-wt/", hashes: [] },
+    WebSocket: CountingWS,
+    WebTransport: wt && wt.FakeWT,
+    libcurl,
+  });
+  const events = [];
+  for (const name of ["servers", "transport", "error"]) st.on(name, (d) => events.push({ name, d }));
+  return new Promise((resolve) => {
+    st.on("transport", () => {
+      st.stop();
+      resolve({ events, libcurl, wsMade });
+    });
+    st.on("error", (d) => resolve({ error: d, events, libcurl, wsMade }));
+    st.start();
+  });
+}
+
+test("engine, Netflix mode over WebTransport: api.fast.com through the run's session, no WebSocket", async () => {
+  const wt = fakeWtFactory({ window: 8 });
+  const r = await netflixWith({ wt, FakeWS: wt.FakeWS });
+  assert.equal(r.error, undefined);
+  assert.deepEqual(r.events.map((e) => e.name), ["servers", "transport"], "servers, then transport, as before");
+  assert.equal(r.events[0].d.targets[0].label, "Testville, US");
+  assert.equal(r.events[1].d.transport, "webtransport");
+  assert.deepEqual(r.libcurl.calls, ["custom"]);
+  assert.equal(r.libcurl.sockets, 1);
+  assert.deepEqual(wt.stats.targets, ["api.fast.com:443"], "a Wisp stream to api.fast.com");
+  assert.equal(wt.stats.sessions.length, 1, "on the session the transport was proven with");
+  assert.equal(r.wsMade, 0, "no WebSocket at all");
+});
+
+test("engine, Netflix mode over WebSocket: libcurl opens its own Wisp WebSocket, as before", async () => {
+  const wt = fakeWtFactory({ window: 8 });
+  const r = await netflixWith({ transport: "websocket", wt, FakeWS: wt.FakeWS });
+  assert.equal(r.error, undefined);
+  assert.deepEqual(r.libcurl.calls, ["wisp"]);
+  assert.equal(r.libcurl.websocketUrl, "wss://wisp.baby/");
+  assert.equal(wt.stats.sessions.length, 0);
+  // And after a WebTransport run, the next WebSocket run puts libcurl back on its own transport.
+  const r2 = await netflixWith({ wt: fakeWtFactory({ window: 8 }), FakeWS: wt.FakeWS });
+  assert.deepEqual(r2.libcurl.calls, ["custom"]);
+  const shared = fakeLibcurl(wt.FakeWS);
+  shared.transport = libcurlTransport(() => null);
+  const st = createSpeedtest({ mode: "netflix", wispUrl: "wss://wisp.baby/", transport: "websocket", WebSocket: wt.FakeWS, libcurl: shared });
+  await new Promise((resolve) => {
+    st.on("transport", () => (st.stop(), resolve()));
+    st.on("error", resolve);
+    st.start();
+  });
+  assert.deepEqual(shared.calls, ["wisp"]);
 });

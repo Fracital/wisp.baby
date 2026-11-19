@@ -7,11 +7,7 @@ const LIBCURL_BASE = "https://cdn.jsdelivr.net/npm/libcurl.js@0.7.4/";
 const MODES = ["gcore", "netflix"];
 const KEY_MODE = "wispbaby.mode";
 const KEY_SETTINGS = "wispbaby.settings";
-const KEY_WT_FAILED = "wispbaby.wtFailed";
 const DEFAULTS = Object.freeze({ connMin: 1, connMax: 8, durMin: 5, durMax: 30, showAll: false, transport: "auto" });
-// After WebTransport failed to open here, `auto` goes straight to WebSocket for this long instead
-// of waiting for it again on every run (a network that drops UDP never answers).
-const WT_FAILED_MS = 60 * 60 * 1000;
 const WT_CONFIG_TIMEOUT_MS = 2000;
 
 const $ = (id) => document.getElementById(id);
@@ -25,6 +21,9 @@ function load(key) {
 function save(key, value) {
   try { localStorage.setItem(key, value); } catch { /* not persisted, fine */ }
 }
+// An earlier page remembered a failed WebTransport under this key and skipped it for an hour.
+// Nothing reads it now (`auto` always tries WebTransport first); don't leave it behind.
+try { localStorage.removeItem("wispbaby.wtFailed"); } catch { /* fine */ }
 
 function loadSettings() {
   let s = {};
@@ -78,7 +77,7 @@ const fmtMs = (ms) => {
 
 const params = new URLSearchParams(location.search);
 // ?wisp=<url> and ?where=<url> are dev overrides (dev/serve.py, local mocks). ?transport=wt|ws|auto
-// overrides the transport setting for this page load (and ignores a remembered WebTransport failure).
+// overrides the transport setting for this page load.
 const wispUrl = params.get("wisp") || `wss://${location.host}/`;
 const whereUrl = params.get("where") || "/where";
 const TRANSPORT_PARAM = { wt: "webtransport", webtransport: "webtransport", ws: "websocket", websocket: "websocket", auto: "auto" };
@@ -235,11 +234,6 @@ function showError(message, phase) {
 
 // ---------- the transport ----------
 
-function wtFailedRecently() {
-  const at = Number(load(KEY_WT_FAILED));
-  return Number.isFinite(at) && at > 0 && Date.now() - at < WT_FAILED_MS;
-}
-
 /** /webtransport.json, or null when the relay has none (absent, not JSON, slow, blocked). */
 async function fetchWtConfig() {
   if (!wtConfigUrl) return null;
@@ -262,9 +256,6 @@ async function transportOptions() {
   if (transport === "websocket") return { transport };
   if (typeof WebTransport !== "function") {
     return { transport, note: transport === "auto" ? "this browser has no WebTransport" : undefined };
-  }
-  if (transport === "auto" && !transportParam && wtFailedRecently()) {
-    return { transport, note: "WebTransport failed here recently" };
   }
   return { transport, webtransport: await fetchWtConfig() };
 }
@@ -323,12 +314,7 @@ async function start() {
 
   on("transport", (via) => {
     let note = tr.note;
-    if (via.fallback) {
-      note = `WebTransport did not open: ${via.fallback}`;
-      if (tr.transport === "auto") save(KEY_WT_FAILED, String(Date.now()));
-    } else if (via.transport === "webtransport") {
-      save(KEY_WT_FAILED, "0");
-    }
+    if (via.fallback) note = `WebTransport did not open: ${via.fallback}`;
     drawTransport({ ...via, note });
   });
 

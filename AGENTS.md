@@ -99,12 +99,17 @@ in infra, or the page will ask for something no box serves.
   on both transports. `test/wisp-http.test.mjs` holds the fake server (behind a fake WebSocket and
   a fake WebTransport) that checks this, so keep it passing rather than loosening it.
 - **One connection per worker, opened once, one transport per run.** The run chooses WebTransport
-  or WebSocket before the download (`auto`: WebTransport if its first session opens within 3 s),
+  or WebSocket before anything else (`auto`: WebTransport if one of two fresh sessions opens within
+  3 s each; nothing about a failure is remembered between runs),
   opens `connections.max` connections, and workers lease them exclusively and hand them back.
   Opening sockets mid-test brings back Chrome's 5–15 s handshake stall under upload load (README).
   Don't "simplify" this into a connection per request, one WebTransport session shared by every
   worker (separate QUIC connections are what separate TCP connections are), or a run that mixes
   transports.
+- **A WebTransport run opens no WebSocket**, Netflix mode's `api.fast.com` call included: libcurl.js
+  gets `libcurlTransport` (each of its TCP connections a Wisp stream on one of the run's sessions,
+  `WispPool.shared`), and the transport is chosen before the server list is fetched for that
+  reason. `browser.test.mjs` counts the page's WebSockets to hold it.
 - **Upload counts bytes that left the connection**: on a WebSocket, bytes given to `ws.send` minus
   `ws.bufferedAmount`; on WebTransport, bytes written minus those whose `write()` has not resolved.
   Sent only inside the Wisp window and under the buffer cap. Counting bytes handed to `send` or
@@ -128,8 +133,10 @@ in infra, or the page will ask for something no box serves.
   the page in headless Chrome):
   `HOLYWISP_BIN=~/.cache/wispbaby/holywisp-dev/<…>/holywisp node --test test/e2e.test.mjs` and
   `HOLYWISP_BIN=~/src/holyWisp/build/release/holywisp node --test test/browser.test.mjs`. Add
-  `E2E_NETFLIX=1` if you touched Netflix mode or libcurl loading. It needs internet, and the
-  process lingers for about 5 minutes after passing because of a libcurl.js timer.
+  `E2E_NETFLIX=1` to either if you touched Netflix mode or libcurl loading (in `browser.test.mjs`
+  it runs Netflix mode over WebTransport, as far as the first seconds of the download). It needs
+  internet, and `e2e.test.mjs` lingers for about 5 minutes after passing because of a libcurl.js
+  timer.
 - If you touched the page, run it: `dev/run-holywisp.sh` (with `HOLYWISP_BIN` for WebTransport),
   then `python3 dev/serve.py`, then open `http://127.0.0.1:8080/?wisp=ws://127.0.0.1:6011/`. Run
   both modes, check light and dark and phone width, and look for console errors.

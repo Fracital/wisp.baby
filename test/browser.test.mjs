@@ -6,11 +6,15 @@
 //
 //   HOLYWISP_BIN=~/src/holyWisp/build/release/holywisp node --test test/browser.test.mjs
 //
-// Cases: auto (must run over WebTransport), ?transport=ws (WebSocket), and auto against a listener
-// that does not answer (falls back to WebSocket and says why). Each full run fails on any console
-// error, uncaught exception or CSP violation. E2E_SCREENSHOTS=<dir> also saves the finished page at
-// phone width in light and dark. Chrome drives over the DevTools protocol (Node's own WebSocket).
-// Everything is on 127.0.0.1.
+// Cases: auto (must run over WebTransport and create no WebSocket at all, counted by the DevTools
+// Network domain and by a wrapped constructor), ?transport=ws (WebSocket), and auto against a listener that does not answer
+// (two WebTransport sessions, then WebSocket, and says why; the next run tries WebTransport again).
+// Each full run fails on any console error, uncaught exception or CSP violation.
+// E2E_SCREENSHOTS=<dir> also saves the finished page at phone width in light and dark. Chrome
+// drives over the DevTools protocol (Node's own WebSocket). Everything is on 127.0.0.1, except with
+// E2E_NETFLIX=1: then Netflix mode runs over WebTransport too (libcurl.js from jsDelivr, the
+// api.fast.com call and the first seconds of the download through the local holyWisp; needs
+// internet), and must create no WebSocket either.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
@@ -154,7 +158,10 @@ test("the page in headless Chrome against holyWisp with WebTransport", { skip, t
   t.after(() => cdp.close());
 
   let problems = [];
+  // Every WebSocket the page creates (the DevTools session's own is not the page's).
+  let websockets = [];
   cdp.on((method, p) => {
+    if (method === "Network.webSocketCreated") websockets.push(p.url);
     if (method === "Runtime.exceptionThrown") problems.push(`exception: ${p.exceptionDetails.exception?.description || p.exceptionDetails.text}`);
     if (method === "Runtime.consoleAPICalled" && (p.type === "error" || p.type === "assert")) {
       problems.push(`console.${p.type}: ${p.args.map((a) => a.value ?? a.description).join(" ")}`);
@@ -167,6 +174,19 @@ test("the page in headless Chrome against holyWisp with WebTransport", { skip, t
   await cdp.send("Runtime.enable");
   await cdp.send("Log.enable");
   await cdp.send("Page.enable");
+  // Count the page's WebSockets and WebTransport sessions as they are made (the engine and
+  // libcurl.js take the constructors from the global when they need one). The Network domain counts
+  // WebSockets too, independently, but only where a run should have none: while it is on, Chrome
+  // copies every WebSocket frame to DevTools, which makes a WebSocket run three times slower.
+  await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
+    source: `window.__wsMade = 0;
+    window.WebSocket = class extends WebSocket { constructor(...a) { super(...a); window.__wsMade++; } };
+    if (typeof WebTransport === "function") {
+      window.__wtMade = 0;
+      window.WebTransport = class extends WebTransport { constructor(...a) { super(...a); window.__wtMade++; } };
+    }`,
+  });
+  const made = async () => JSON.parse(await cdp.eval(`JSON.stringify({ ws: window.__wsMade, wt: window.__wtMade })`));
 
   const origin = `http://127.0.0.1:${sitePort}`;
   const wispUrl = `ws://127.0.0.1:${wispPort}/`;
@@ -178,6 +198,7 @@ test("the page in headless Chrome against holyWisp with WebTransport", { skip, t
 
   async function runPage(query, { until = "done", ms = 120000 } = {}) {
     problems = [];
+    websockets = [];
     await cdp.send("Page.navigate", { url: `${origin}/?wisp=${encodeURIComponent(wispUrl)}${query}#gcore` });
     const t0 = Date.now();
     const page = await waitFor(async () => {
@@ -219,7 +240,9 @@ test("the page in headless Chrome against holyWisp with WebTransport", { skip, t
   const num = (s) => parseFloat(s);
 
   await t.test("auto: the whole test over WebTransport", async () => {
+    await cdp.send("Network.enable");
     const p = await runPage("");
+    await cdp.send("Network.disable");
     t.diagnostic(`auto: ${JSON.stringify(p)}`);
     assert.equal(p.error, null);
     assert.deepEqual(problems, []);
@@ -228,6 +251,11 @@ test("the page in headless Chrome against holyWisp with WebTransport", { skip, t
     assert.ok(num(p.down) > 0 && num(p.up) > 0, "download and upload speeds");
     assert.ok(num(p.mbDown) > 0 && num(p.mbUp) > 0, "data used");
     assert.ok(Number.isFinite(num(p.unloaded)) && Number.isFinite(num(p.loaded)), "latencies");
+    const n = await made();
+    t.diagnostic(`auto: WebSockets: ${websockets.length} (Network domain), ${n.ws} (constructor); WebTransport sessions: ${n.wt}`);
+    assert.deepEqual(websockets, [], "no WebSocket during the whole run (Network.webSocketCreated)");
+    assert.equal(n.ws, 0, "no WebSocket during the whole run (constructor)");
+    assert.equal(n.wt, 8, "one session per connection (connMax 8)");
     await screenshots("webtransport");
   });
 
@@ -239,9 +267,13 @@ test("the page in headless Chrome against holyWisp with WebTransport", { skip, t
     assert.equal(p.via, "· via WebSocket");
     assert.equal(p.transport, `WebSocket to ${wispUrl}`);
     assert.ok(num(p.down) > 0 && num(p.up) > 0);
+    const n = await made();
+    t.diagnostic(`websocket: WebSockets: ${n.ws}; WebTransport sessions: ${n.wt}`);
+    assert.ok(n.ws >= 1, "the run's WebSockets");
+    assert.equal(n.wt, 0);
   });
 
-  await t.test("auto, the listener does not answer: WebSocket, and why", async () => {
+  await t.test("auto, the listener does not answer: a second session, then WebSocket, and why", async () => {
     // A holyWisp whose /webtransport.json names a UDP port nobody listens on.
     const deadPort = await freePort();
     const port2 = await freePort();
@@ -250,6 +282,7 @@ test("the page in headless Chrome against holyWisp with WebTransport", { skip, t
     );
     const url2 = `ws://127.0.0.1:${port2}/`;
     problems = [];
+    websockets = [];
     await cdp.send("Page.navigate", { url: `${origin}/?wisp=${encodeURIComponent(url2)}#gcore` });
     const p = await waitFor(async () => {
       const s = JSON.parse(await cdp.eval(READ_PAGE));
@@ -259,16 +292,44 @@ test("the page in headless Chrome against holyWisp with WebTransport", { skip, t
     assert.equal(p.error, null);
     assert.equal(p.via, "· via WebSocket");
     assert.match(p.transport, new RegExp(`^WebSocket to ws://127\\.0\\.0\\.1:${port2}/ \\(WebTransport did not open: .+\\)$`));
+    const n = await made();
+    t.diagnostic(`fallback: WebTransport sessions: ${n.wt}, then WebSockets: ${n.ws}`);
+    assert.equal(n.wt, 2, "two fresh sessions before the fallback");
+    assert.ok(n.ws >= 1, "then the run's WebSockets");
     // Chrome logs the failed handshake to the dead port itself; nothing else may be wrong.
     assert.deepEqual(problems.filter((m) => !m.includes(`https://127.0.0.1:${deadPort}/`) && !/WebTransport/.test(m)), []);
-    // Remembered: the next auto run does not wait for it again.
+    // Not remembered: the next auto run tries WebTransport first again.
+    await cdp.send("Page.reload", { ignoreCache: true });  // the same URL again would only be a fragment change
     const q = await waitFor(async () => {
-      await cdp.send("Page.reload", { ignoreCache: true });  // the same URL again would only be a fragment change
-      await sleep(1500);
       const s = JSON.parse(await cdp.eval(READ_PAGE));
       return s.via ? s : null;
-    }, 20000, "the second run");
-    assert.match(q.transport, /\(WebTransport failed here recently\)$/);
+    }, 30000, "the second run");
+    assert.match(q.transport, /\(WebTransport did not open: .+\)$/);
+    assert.equal((await made()).wt, 2, "two sessions tried again");
     await cdp.send("Page.navigate", { url: "about:blank" });
+  });
+
+  await t.test("Netflix mode over WebTransport: api.fast.com through the session, no WebSocket", { skip: !process.env.E2E_NETFLIX && "set E2E_NETFLIX=1" }, async () => {
+    problems = [];
+    websockets = [];
+    await cdp.send("Network.enable");
+    await cdp.send("Page.navigate", { url: `${origin}/?wisp=${encodeURIComponent(wispUrl)}#netflix` });
+    // Up to the first seconds of the download (enough to know the OCAs answer over it), then away.
+    const p = await waitFor(async () => {
+      const s = JSON.parse(await cdp.eval(READ_PAGE));
+      if (s.error) return s;
+      const targets = await cdp.eval(`document.getElementById("fact-targets").textContent`);
+      return s.via && s.phase === "download" && num(s.mbDown) > 0 && targets !== "…" ? { ...s, targets } : null;
+    }, 120000, "Netflix mode's download");
+    t.diagnostic(`netflix: ${JSON.stringify(p)}`);
+    const n = await made();
+    await cdp.send("Page.navigate", { url: "about:blank" });
+    await cdp.send("Network.disable");
+    assert.equal(p.error, null);
+    assert.deepEqual(problems, []);
+    assert.equal(p.via, "· via WebTransport (QUIC)");
+    t.diagnostic(`netflix: WebSockets: ${websockets.length} (Network domain), ${n.ws} (constructor); WebTransport sessions: ${n.wt}`);
+    assert.deepEqual(websockets, [], "no WebSocket, libcurl's included (Network.webSocketCreated)");
+    assert.equal(n.ws, 0, "no WebSocket, libcurl's included (constructor)");
   });
 });

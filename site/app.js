@@ -1,13 +1,18 @@
 // wisp.baby UI. The engine (speedtest.js) does the measuring; this file only
 // drives it and draws what it reports. Contract: README.md.
-import { createSpeedtest } from "./speedtest.js";
+import { createSpeedtest, TRANSPORTS, webtransportConfigUrl } from "./speedtest.js";
 import * as ls from "./livestats.js";
 
 const LIBCURL_BASE = "https://cdn.jsdelivr.net/npm/libcurl.js@0.7.4/";
 const MODES = ["gcore", "netflix"];
 const KEY_MODE = "wispbaby.mode";
 const KEY_SETTINGS = "wispbaby.settings";
-const DEFAULTS = Object.freeze({ connMin: 1, connMax: 8, durMin: 5, durMax: 30, showAll: false });
+const KEY_WT_FAILED = "wispbaby.wtFailed";
+const DEFAULTS = Object.freeze({ connMin: 1, connMax: 8, durMin: 5, durMax: 30, showAll: false, transport: "auto" });
+// After WebTransport failed to open here, `auto` goes straight to WebSocket for this long instead
+// of waiting for it again on every run (a network that drops UDP never answers).
+const WT_FAILED_MS = 60 * 60 * 1000;
+const WT_CONFIG_TIMEOUT_MS = 2000;
 
 const $ = (id) => document.getElementById(id);
 const body = document.body;
@@ -29,13 +34,15 @@ function loadSettings() {
     if (Number.isInteger(s[k])) out[k] = s[k];
   }
   out.showAll = s.showAll === true;
+  if (TRANSPORTS.includes(s.transport)) out.transport = s.transport;
   return validSettings(out) ? out : { ...DEFAULTS };
 }
 
 function validSettings(s) {
   const inRange = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
   return inRange(s.connMin, 1, 8) && inRange(s.connMax, 1, 8) && s.connMin <= s.connMax
-    && inRange(s.durMin, 5, 30) && inRange(s.durMax, 5, 30) && s.durMin <= s.durMax;
+    && inRange(s.durMin, 5, 30) && inRange(s.durMax, 5, 30) && s.durMin <= s.durMax
+    && TRANSPORTS.includes(s.transport);
 }
 
 // ---------- formatting (README "Display") ----------
@@ -70,9 +77,15 @@ const fmtMs = (ms) => {
 // ---------- page parameters ----------
 
 const params = new URLSearchParams(location.search);
-// ?wisp=<url> and ?where=<url> are dev overrides (dev/serve.py, local mocks).
+// ?wisp=<url> and ?where=<url> are dev overrides (dev/serve.py, local mocks). ?transport=wt|ws|auto
+// overrides the transport setting for this page load (and ignores a remembered WebTransport failure).
 const wispUrl = params.get("wisp") || `wss://${location.host}/`;
 const whereUrl = params.get("where") || "/where";
+const TRANSPORT_PARAM = { wt: "webtransport", webtransport: "webtransport", ws: "websocket", websocket: "websocket", auto: "auto" };
+const transportParam = TRANSPORT_PARAM[(params.get("transport") || "").toLowerCase()] || null;
+// The relay describes its WebTransport listener at /webtransport.json on the origin that serves
+// its WebSocket: this page's own origin on the boxes (or the ?wisp= relay's, in dev).
+const wtConfigUrl = webtransportConfigUrl(wispUrl);
 
 let settings = loadSettings();
 let mode = modeFromHash() || (MODES.includes(load(KEY_MODE)) ? load(KEY_MODE) : "gcore");
@@ -132,6 +145,27 @@ function drawWhere() {
   drawWisp(where);
 }
 
+const TRANSPORT_TEXT = { webtransport: "WebTransport (QUIC)", websocket: "WebSocket" };
+
+/** The transport the run uses (the engine's `transport` event), or null while it is not known. */
+function drawTransport(t) {
+  const via = $("route-via");
+  const fact = $("fact-transport");
+  if (!t) {
+    via.hidden = true;
+    via.textContent = "";
+    fact.textContent = "…";
+    return;
+  }
+  via.textContent = ` · via ${TRANSPORT_TEXT[t.transport]}`;
+  via.hidden = false;
+  fact.replaceChildren(`${TRANSPORT_TEXT[t.transport]} to `);
+  const code = document.createElement("code");
+  code.textContent = t.url;
+  fact.append(code);
+  if (t.note) fact.append(` (${t.note})`);
+}
+
 function drawWisp(w) {
   if (!w) { $("fact-wisp").textContent = "…"; return; }
   const place = [w.city, w.country].filter(Boolean).join(", ");
@@ -175,6 +209,7 @@ function resetView() {
   $("data-down").textContent = "0";
   $("data-up").textContent = "0";
   drawTargets(null);
+  drawTransport(null);
   drawWisp(where);
   document.title = "wisp.baby: internet speed test over Wisp";
   setPhase("servers");
@@ -198,6 +233,42 @@ function showError(message, phase) {
   setPhase("idle");
 }
 
+// ---------- the transport ----------
+
+function wtFailedRecently() {
+  const at = Number(load(KEY_WT_FAILED));
+  return Number.isFinite(at) && at > 0 && Date.now() - at < WT_FAILED_MS;
+}
+
+/** /webtransport.json, or null when the relay has none (absent, not JSON, slow, blocked). */
+async function fetchWtConfig() {
+  if (!wtConfigUrl) return null;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), WT_CONFIG_TIMEOUT_MS);
+  try {
+    const res = await fetch(wtConfigUrl, { cache: "no-store", credentials: "omit", signal: ctl.signal });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The engine's transport options for this run, and a note for the facts when auto skips WebTransport. */
+async function transportOptions() {
+  const transport = transportParam || settings.transport;
+  if (transport === "websocket") return { transport };
+  if (typeof WebTransport !== "function") {
+    return { transport, note: transport === "auto" ? "this browser has no WebTransport" : undefined };
+  }
+  if (transport === "auto" && !transportParam && wtFailedRecently()) {
+    return { transport, note: "WebTransport failed here recently" };
+  }
+  return { transport, webtransport: await fetchWtConfig() };
+}
+
 // ---------- the test ----------
 
 async function start() {
@@ -219,6 +290,9 @@ async function start() {
     drawWhere();
   }
 
+  const tr = await transportOptions();
+  if (my !== run) return;
+
   let t;
   try {
     t = createSpeedtest({
@@ -230,6 +304,8 @@ async function start() {
       connections: { min: settings.connMin, max: settings.connMax },
       duration: { min: settings.durMin, max: settings.durMax },
       libcurlBase: LIBCURL_BASE,
+      transport: tr.transport,
+      webtransport: tr.webtransport,
     });
   } catch (e) {
     showError(e?.message, "servers");
@@ -243,6 +319,17 @@ async function start() {
     setPhase(phase);
     if (phase === "upload") $("up-status").textContent = "Measuring…";
     if (phase === "latency") $("up-status").textContent = "Up next";
+  });
+
+  on("transport", (via) => {
+    let note = tr.note;
+    if (via.fallback) {
+      note = `WebTransport did not open: ${via.fallback}`;
+      if (tr.transport === "auto") save(KEY_WT_FAILED, String(Date.now()));
+    } else if (via.transport === "webtransport") {
+      save(KEY_WT_FAILED, "0");
+    }
+    drawTransport({ ...via, note });
   });
 
   on("servers", ({ wisp, targets }) => {
@@ -368,6 +455,7 @@ function setSettings(open) {
     form.durMin.value = settings.durMin;
     form.durMax.value = settings.durMax;
     form.showAll.checked = settings.showAll;
+    form.transport.value = settings.transport;
     form.connMin.focus();
   }
 }
@@ -382,6 +470,7 @@ form.addEventListener("submit", (e) => {
     connMin: num(form.connMin), connMax: num(form.connMax),
     durMin: num(form.durMin), durMax: num(form.durMax),
     showAll: form.showAll.checked,
+    transport: form.transport.value,
   };
   if (!validSettings(next)) {
     const err = $("settings-err");
@@ -389,7 +478,7 @@ form.addEventListener("submit", (e) => {
     err.hidden = false;
     return;
   }
-  const changed = ["connMin", "connMax", "durMin", "durMax"].some((k) => next[k] !== settings[k]);
+  const changed = ["connMin", "connMax", "durMin", "durMax", "transport"].some((k) => next[k] !== settings[k]);
   settings = next;
   save(KEY_SETTINGS, JSON.stringify(settings));
   setSettings(false);

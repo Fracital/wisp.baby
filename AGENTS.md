@@ -9,8 +9,10 @@ repository is worked on.
 
 wisp.baby is a fast.com-style speed test that runs **entirely over Wisp**, plus the front page of
 the public Wisp relay that serves it. It is one static page with no build step: plain ES modules,
-one stylesheet, an SVG icon. The page talks to exactly two things: the Wisp relay on the origin it
-was loaded from, and (in Netflix mode only) libcurl.js from jsDelivr.
+one stylesheet, an SVG icon. The page talks to exactly two things: the Wisp relay (its WebSocket and
+`/webtransport.json` on the origin the page was loaded from, and the WebTransport listener that
+file names, holyWisp on udp 443 at holywisp.fracit.al), and (in Netflix mode only) libcurl.js from
+jsDelivr.
 
 - `site/` is what is served. Every file in it is public and ships as it is.
 - `dev/` is a local harness (a stdlib Python server and a script that runs holyWisp on loopback).
@@ -21,11 +23,12 @@ Related repositories, all sibling checkouts:
 
 - `~/src/holyWisp`: the Wisp server behind the page. A protocol question is settled by its
   `AGENTS.md` "Protocol surface", not by what this page happens to do.
-- `~/src/abulxt`: production. `deploy/wispbaby/` is the copy the servers actually serve:
-  `deploy/ansible/roles/edge_relay` copies its `site/` to `/var/www/wispbaby/` on every
-  `[wisp_edge]` box and renders `conf.d/40-wispbaby.conf` (`templates/wispbaby.conf.j2`), which
-  implements this README's server contract. DNS (geo nameservers, `<site>.wisp.baby`, the apex) is
-  `roles/edge_dns`, and the holyWisp build is pinned in `roles/edge_wisp`.
+- `~/src/infra` (was `~/src/abulxt` until 2026-11-18): production. `wispbaby/` is the copy the
+  servers actually serve: `ansible/roles/edge_relay` copies its `site/` to `/var/www/wispbaby/` on
+  every `[wisp_edge]` box and renders `conf.d/40-wispbaby.conf` (`templates/wispbaby.conf.j2`),
+  which implements this README's server contract. DNS (geo nameservers, `<site>.wisp.baby`, the
+  apex) is `roles/edge_dns`, and the holyWisp build (and its WebTransport listener,
+  `holywisp_webtransport*`) is pinned in `roles/edge_wisp`.
 
 ## Hard rules (read first)
 
@@ -41,19 +44,20 @@ Related repositories, all sibling checkouts:
 
 ### Two copies, one page
 
-This repository is the public source. abulxt's `deploy/wispbaby/` is what the boxes serve. The two
-must stay identical apart from the path comments, which say `README.md` here and
-`deploy/wispbaby/README.md` there. A change to `site/`, `test/` or `dev/` lands in both copies in
-the same piece of work. Check with `diff -r` and expect only those comment lines to differ. A change
-to the server contract (a new endpoint, header, limit or `/where` field) also lands in
-`wispbaby.conf.j2` in abulxt, or the page will ask for something no box serves.
+This repository is the public source. infra's `wispbaby/` is what the boxes serve. The two must
+stay identical apart from the path comments, which say `README.md` here and `wispbaby/README.md`
+there, and infra's prettier formatting (tabs, single quotes). A change to `site/`, `test/` or `dev/`
+lands in both copies in the same piece of work. Check with `diff -r` after formatting and expect
+only those to differ. A change to the server contract (a new endpoint, header, limit, `/where`
+field or an origin the page connects to, which the CSP must allow) also lands in `wispbaby.conf.j2`
+in infra, or the page will ask for something no box serves.
 
 ### Deployments and servers
 
 - **This repository deploys nothing.** Pushing here changes no server. The boxes get a new page
-  when abulxt's `deploy/wispbaby/` changes and abulxt's `playbooks/wisp.yml` (or `edges.yml`) is
+  when infra's `wispbaby/` changes and infra's `ansible/playbooks/edges.yml` (or `wisp.yml`) is
   run with `--tags relay`. That run is a production change: it needs the user's go-ahead in the
-  current turn, like any other abulxt playbook.
+  current turn, like any other infra playbook.
 - Never point a test, a benchmark or the dev harness at a box you were not told to use. The
   harness and the e2e test bind their own services on 127.0.0.1 for exactly this reason. A real
   speed test against wisp.baby moves gigabytes through a production relay that other people use.
@@ -90,16 +94,21 @@ to the server contract (a new endpoint, header, limit or `/where` field) also la
 
 ## The engine (do not regress)
 
-- **Wisp v1, no subprotocol.** The client offers none and the relay expects none. The engine
-  honours the CONTINUE window on every stream. `test/wisp-http.test.mjs` holds the fake server that
-  checks this, so keep it passing rather than loosening it.
-- **One WebSocket per worker, opened once.** The run opens `connections.max` sockets before the
-  download, and workers lease them exclusively and hand them back. Opening sockets mid-test brings
-  back Chrome's 5–15 s handshake stall under upload load (README, last section). Don't "simplify"
-  this into a socket per request.
-- **Upload counts bytes that left the socket**: bytes given to `ws.send` minus
-  `ws.bufferedAmount`, sent only inside the Wisp window and under the buffer cap. Counting bytes
-  handed to `send` reports the browser's buffer, not the network.
+- **Wisp v1, no subprotocol.** The client offers none (no WebSocket subprotocol, no WebTransport
+  `protocols`) and the relay expects none. The engine honours the CONTINUE window on every stream,
+  on both transports. `test/wisp-http.test.mjs` holds the fake server (behind a fake WebSocket and
+  a fake WebTransport) that checks this, so keep it passing rather than loosening it.
+- **One connection per worker, opened once, one transport per run.** The run chooses WebTransport
+  or WebSocket before the download (`auto`: WebTransport if its first session opens within 3 s),
+  opens `connections.max` connections, and workers lease them exclusively and hand them back.
+  Opening sockets mid-test brings back Chrome's 5–15 s handshake stall under upload load (README).
+  Don't "simplify" this into a connection per request, one WebTransport session shared by every
+  worker (separate QUIC connections are what separate TCP connections are), or a run that mixes
+  transports.
+- **Upload counts bytes that left the connection**: on a WebSocket, bytes given to `ws.send` minus
+  `ws.bufferedAmount`; on WebTransport, bytes written minus those whose `write()` has not resolved.
+  Sent only inside the Wisp window and under the buffer cap. Counting bytes handed to `send` or
+  `write` reports the browser's buffer, not the network.
 - **The algorithm's numbers are fast.com's**: the 150 ms tick, the ramp thresholds, the
   stableMovingAverage(5), the stopper's 7 s / 30 s / 2 % / 6, the latency percentiles, the retry
   limits and the display rounding. A different number is a different speed test. Change one only
@@ -114,15 +123,18 @@ to the server contract (a new endpoint, header, limit or `/where` field) also la
 - `node --test 'test/*.test.mjs'` passes. Pass the glob: a bare directory argument fails on Node
   24 with "test failed" and runs nothing.
 - If you touched the Wisp client, the HTTP parser, the socket pool or upload counting, also run the
-  end-to-end test against a real holyWisp (the npm build `run-holywisp.sh` fetches, integrity
-  checked):
-  `HOLYWISP_BIN=~/.cache/abulxt/holywisp-dev/<…>/holywisp node --test test/e2e.test.mjs`. Add
+  end-to-end tests against a real holyWisp (the npm build `run-holywisp.sh` fetches, integrity
+  checked, for `e2e.test.mjs`; a local build with WebTransport for `browser.test.mjs`, which runs
+  the page in headless Chrome):
+  `HOLYWISP_BIN=~/.cache/wispbaby/holywisp-dev/<…>/holywisp node --test test/e2e.test.mjs` and
+  `HOLYWISP_BIN=~/src/holyWisp/build/release/holywisp node --test test/browser.test.mjs`. Add
   `E2E_NETFLIX=1` if you touched Netflix mode or libcurl loading. It needs internet, and the
   process lingers for about 5 minutes after passing because of a libcurl.js timer.
-- If you touched the page, run it: `dev/run-holywisp.sh`, then `python3 dev/serve.py`, then open
-  `http://127.0.0.1:8080/?wisp=ws://127.0.0.1:6011/`. Run both modes, check light and dark and phone
-  width, and look for console errors.
-- `diff -r` against abulxt's `deploy/wispbaby/` shows only the path comments.
+- If you touched the page, run it: `dev/run-holywisp.sh` (with `HOLYWISP_BIN` for WebTransport),
+  then `python3 dev/serve.py`, then open `http://127.0.0.1:8080/?wisp=ws://127.0.0.1:6011/`. Run
+  both modes, check light and dark and phone width, and look for console errors.
+  `browser.test.mjs` with `E2E_SCREENSHOTS=<dir>` saves phone-width shots in both themes.
+- `diff -r` against infra's `wispbaby/` shows only the path comments and formatting.
 
 ## Hand-off
 
@@ -130,7 +142,7 @@ End every piece of work with:
 
 - what changed (files and behaviour)
 - what you ran and its result (the `node --test` summary, and the e2e result if it applies)
-- whether abulxt's copy and `wispbaby.conf.j2` were updated to match
+- whether infra's copy and `wispbaby.conf.j2` were updated to match
 - anything left undone or deliberately out of scope
 
 If anything is uncommitted, say so. Don't commit to tidy up.

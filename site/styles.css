@@ -510,7 +510,8 @@ body[data-mode="gcore"] .node-oca {
   color: var(--muted);
 }
 .settings label { display: inline-flex; align-items: center; gap: 8px; font-size: 15px; }
-.settings input[type="number"] {
+.settings input[type="number"],
+.settings select {
   font: inherit;
   width: 72px;
   padding: 6px 8px;
@@ -519,6 +520,8 @@ body[data-mode="gcore"] .node-oca {
   background: var(--bg);
   color: var(--fg);
 }
+.settings select { width: auto; max-width: 100%; }
+.settings fieldset label:has(select) { flex-wrap: wrap; max-width: 100%; }
 .settings input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); }
 .settings-err { margin: 0; color: var(--error); font-size: 14px; }
 .settings-actions { display: flex; gap: 10px; }

@@ -5,9 +5,16 @@
 #   python3 dev/serve.py         # http://127.0.0.1:8080/ (+ :8081 speed test)
 #   open http://127.0.0.1:8080/?wisp=ws://127.0.0.1:6011/
 #
-# Fetches the published npm package holywisp@0.5.2 (the version the boxes run) into
-# ~/.cache/wispbaby/holywisp-dev/, checks the tarball against its pinned sha512 integrity, extracts
-# only bin/<platform>/holywisp, writes a dev config and runs it in the foreground (Ctrl+C stops it).
+# Fetches the published npm package holywisp@0.5.2 into ~/.cache/wispbaby/holywisp-dev/, checks the
+# tarball against its pinned sha512 integrity, extracts only bin/<platform>/holywisp, writes a dev
+# config and runs it in the foreground (Ctrl+C stops it).
+#
+# HOLYWISP_BIN=/path/to/holywisp runs that binary instead (a local holyWisp build; nothing is
+# fetched). If the binary has WebTransport (its --help lists `webtransport`), the dev config turns
+# it on: UDP 127.0.0.1:$PORT with a rotating self-signed certificate, described at
+# http://127.0.0.1:$PORT/webtransport.json (URL and certificate hashes), which is where the page
+# looks when it has ?wisp=ws://127.0.0.1:$PORT/. The npm 0.5.2 build has no WebTransport, so the
+# page then runs over WebSocket.
 #
 # The dev config is NOT the edge config: it allows loopback, private and literal-IP destinations
 # (the page's G-Core mode dials 127.0.0.1:8081, serve.py's speed test), has no SOCKS5 router, no
@@ -43,6 +50,11 @@ TGZ="$CACHE/holywisp-$VERSION.tgz"
 BINDIR="$CACHE/$VERSION/$PLATFORM"
 BIN="$BINDIR/holywisp"
 
+if [[ -n "${HOLYWISP_BIN:-}" ]]; then
+  [[ -x "$HOLYWISP_BIN" ]] || die "HOLYWISP_BIN=$HOLYWISP_BIN is not an executable"
+  BIN="$HOLYWISP_BIN"
+else
+
 # 1. The tarball, checked every run (a cached copy that no longer matches is fetched again).
 if [[ ! -f "$TGZ" || "$(sri_sha512 "$TGZ")" != "$INTEGRITY" ]]; then
   rm -f "$TGZ" "$BIN"
@@ -66,6 +78,7 @@ if [[ ! -x "$BIN" ]]; then
   chmod 0755 "$BINDIR.tmp/holywisp"
   rm -rf "$BINDIR"; mv "$BINDIR.tmp" "$BINDIR"
 fi
+fi  # HOLYWISP_BIN
 
 # 3. The dev config.
 CONF="$CACHE/holywisp-dev.conf"
@@ -98,6 +111,9 @@ tcp-nodelay = on
 non-ws-response = "Upgrade Required"
 serve-webclient = off
 EOF
+if "$BIN" --help 2>&1 | grep -q '^ *webtransport '; then
+  printf '\n# WebTransport on UDP 127.0.0.1:%s, self-signed (hashes in /webtransport.json).\nwebtransport = on\n' "$PORT" >> "$CONF"
+fi
 
 echo "run-holywisp: $("$BIN" --version) on ws://127.0.0.1:$PORT/ (config $CONF)" >&2
 exec "$BIN" --config "$CONF"

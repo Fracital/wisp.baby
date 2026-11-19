@@ -67,7 +67,7 @@
           <li class="link link-oca" aria-hidden="true"><span class="link-line"></span></li>
           <li class="node node-oca"><span class="node-dot" aria-hidden="true"></span><span class="node-label">Netflix Open Connect</span></li>
         </ol>
-        <figcaption class="route-caption" id="route-caption">The wisp box is the test server</figcaption>
+        <figcaption class="route-caption"><span id="route-caption">The wisp box is the test server</span><span id="route-via" hidden></span></figcaption>
       </figure>
     </section>
 
@@ -102,6 +102,7 @@
       <dl class="facts">
         <div class="fact"><dt>Data used</dt><dd><span id="data-down">0</span> MB down, <span id="data-up">0</span> MB up</dd></div>
         <div class="fact"><dt>Wisp server</dt><dd id="fact-wisp">…</dd></div>
+        <div class="fact"><dt>Transport</dt><dd id="fact-transport">…</dd></div>
         <div class="fact"><dt>Test servers</dt><dd id="fact-targets">…</dd></div>
       </dl>
 
@@ -119,6 +120,16 @@
           <legend>Test duration (seconds)</legend>
           <label>Min <input type="number" name="durMin" min="5" max="30" step="1" inputmode="numeric" required></label>
           <label>Max <input type="number" name="durMax" min="5" max="30" step="1" inputmode="numeric" required></label>
+        </fieldset>
+        <fieldset>
+          <legend>Transport</legend>
+          <label>Wisp over
+            <select name="transport">
+              <option value="auto">Automatic</option>
+              <option value="webtransport">WebTransport (QUIC)</option>
+              <option value="websocket">WebSocket</option>
+            </select>
+          </label>
         </fieldset>
         <label class="check"><input type="checkbox" name="showAll"> Always show all metrics</label>
         <p class="settings-err" id="settings-err" role="alert" hidden></p>

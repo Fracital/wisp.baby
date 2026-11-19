@@ -1,5 +1,6 @@
 // Unit tests for the Wisp v1 packets, the HTTP/1.1 response parser, and the Wisp/HTTP clients
-// against an in-memory fake Wisp server (checks the CONTINUE window is honoured).
+// against an in-memory fake Wisp server (checks the CONTINUE window is honoured), over a fake
+// WebSocket and a fake WebTransport (length-prefixed packets on one stream, split at random).
 // Run: node --test 'test/*.test.mjs'
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -12,7 +13,11 @@ import {
   decodePacket,
   HttpResponseParser,
   WispConnection,
+  WtConnection,
   WispPool,
+  webtransportConfig,
+  webtransportConfigUrl,
+  createSpeedtest,
   HttpConnection,
   makeTarget,
   netflixTargets,
@@ -317,8 +322,15 @@ test("Wisp: socket close fails the pending request", async () => {
   const conn = new WispConnection("ws://fake/", { WebSocket: FakeWS });
   await conn.open();
   const http = new HttpConnection(async () => conn, target);
-  const pending = http.request({ method: "GET", path: "/r/0-1999999" });
-  setTimeout(() => conn.ws.close(), 5);
+  // Closed once the body has started (not on a timer: the fake can serve all 2 MB within one).
+  let closing = false;
+  const onProgress = () => {
+    if (!closing) {
+      closing = true;
+      conn.ws.close();
+    }
+  };
+  const pending = http.request({ method: "GET", path: "/r/0-1999999", onProgress });
   await assert.rejects(pending, /closed/);
 });
 
@@ -349,4 +361,347 @@ test("WispPool: warm opens up front, leases are exclusive and reused, closed one
   pool.close();
   assert.ok([a, c, d].every((x) => x.closed), "close() closes leased sockets too");
   await assert.rejects(pool.acquire(), /stopped/);
+});
+
+// ---------------------------------------------------------------- WebTransport
+
+/**
+ * A fake WebTransport on the fake Wisp server above: the session's one bidirectional stream carries
+ * Wisp packets each behind a u32 LE length. Toward the client the framed bytes are re-cut at
+ * random (seeded) into reads of 1 byte to 3 KiB, so packets straddle reads and reads hold several
+ * packets. A write resolves `writeDelay` ms after the fake took it (bytes in the browser's network
+ * stack); `stats.resolvedData` is the DATA payload of resolved writes. `mode`: "ok", "refuse" (ready
+ * and closed reject) or "hang" (ready never settles).
+ */
+function fakeWtFactory({ window = 4, writeDelay = 0, mode = "ok", closeEvery = 0 } = {}) {
+  const { FakeWS, stats } = fakeWispFactory({ window, closeEvery });
+  stats.sessions = [];
+  stats.resolvedData = 0;
+  stats.maxQueued = 0;
+  let seed = 12345;
+  const rnd = (n) => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return 1 + (seed % n);
+  };
+  class FakeWT {
+    constructor(url, options = {}) {
+      stats.sessions.push({ url, options });
+      assert.equal(options.protocols, undefined, "no protocols (Wisp v1)");
+      this.url = url;
+      this.closed = new Promise((res, rej) => {
+        this._closedOk = res;
+        this._closedErr = rej;
+      });
+      this.closed.catch(() => {});
+      if (mode === "refuse") {
+        this.ready = Promise.reject(new Error("refused"));
+        this.ready.catch(() => {});
+        setTimeout(() => this._closedErr(new Error("refused")), 0);
+      } else if (mode === "hang") {
+        this.ready = new Promise(() => {});
+      } else {
+        this.ready = Promise.resolve();
+      }
+    }
+    async createBidirectionalStream() {
+      await this.ready;
+      const srv = new FakeWS(this.url);
+      srv.binaryType = "arraybuffer";
+      this.srv = srv;
+      let ctl;
+      let out = [];
+      let flushing = false;
+      const readable = new ReadableStream({ start: (c) => (ctl = c) });
+      const flush = () => {
+        flushing = false;
+        let all = new Uint8Array(out.reduce((n, b) => n + b.length, 0));
+        let off = 0;
+        for (const b of out) {
+          all.set(b, off);
+          off += b.length;
+        }
+        out = [];
+        while (all.length) {
+          const n = Math.min(all.length, rnd(3072));
+          ctl.enqueue(all.slice(0, n));
+          all = all.subarray(n);
+        }
+      };
+      srv.onmessage = ({ data }) => {
+        const p = new Uint8Array(data);
+        const f = new Uint8Array(4 + p.length);
+        new DataView(f.buffer).setUint32(0, p.length, true);
+        f.set(p, 4);
+        out.push(f);
+        if (!flushing) {
+          flushing = true;
+          setTimeout(flush, 0);
+        }
+      };
+      // The path dies: the stream errors at once (what was not read yet is lost), the session with it.
+      this.drop = () => {
+        srv.closed = true;
+        ctl.error(new Error("connection lost"));
+        this._closedErr(new Error("connection lost"));
+      };
+      srv.onclose = () => {
+        try {
+          ctl.close();
+        } catch {
+          /* closed */
+        }
+        this._closedOk({ closeCode: 0, reason: "" });
+      };
+      let pend = new Uint8Array(0);
+      let queued = 0;
+      const writable = new WritableStream({
+        write: (chunk) => {
+          assert.ok(chunk instanceof Uint8Array);
+          const m = new Uint8Array(pend.length + chunk.length);
+          m.set(pend);
+          m.set(chunk, pend.length);
+          pend = m;
+          let data = 0;
+          while (pend.length >= 4) {
+            const n = new DataView(pend.buffer, pend.byteOffset).getUint32(0, true);
+            if (pend.length < 4 + n) break;
+            const pkt = pend.slice(4, 4 + n);
+            pend = pend.subarray(4 + n);
+            if (pkt[0] === PACKET.DATA) data += n - 5;
+            srv.send(pkt);
+          }
+          queued += data;
+          stats.maxQueued = Math.max(stats.maxQueued, queued);
+          return new Promise((r) => setTimeout(r, writeDelay)).then(() => {
+            queued -= data;
+            stats.resolvedData += data;
+          });
+        },
+      });
+      return { readable, writable };
+    }
+    close() {
+      if (this.srv) this.srv.close();
+      else this._closedOk({ closeCode: 0, reason: "" });
+    }
+  }
+  return { FakeWT, FakeWS, stats };
+}
+
+const HASH = { algorithm: "sha-256", value: Buffer.alloc(32, 7).toString("base64") };
+
+test("WebTransport: framing across reads, GET keep-alive, hashes as serverCertificateHashes", async () => {
+  const { FakeWT, stats } = fakeWtFactory({ window: 4 });
+  const conn = new WtConnection("https://fake/", { WebTransport: FakeWT, hashes: [HASH] });
+  await conn.open();
+  assert.equal(conn.initialWindow, 4);
+  assert.equal(conn.transport, "webtransport");
+  const sch = stats.sessions[0].options.serverCertificateHashes;
+  assert.equal(sch.length, 1);
+  assert.equal(sch[0].algorithm, "sha-256");
+  assert.deepEqual([...sch[0].value], [...Buffer.alloc(32, 7)]);
+  const http = new HttpConnection(async () => conn, target);
+  let progress = 0;
+  for (const n of [10000, 1, 123457]) {
+    const r = await http.request({ method: "GET", path: `/r/0-${n - 1}`, onProgress: (d) => (progress += d) });
+    assert.equal(r.ok, true);
+    assert.equal(r.bytes, n);
+  }
+  assert.equal(progress, 10000 + 1 + 123457);
+  assert.equal(stats.connects, 1, "keep-alive reuses the stream");
+  conn.close();
+  // No hashes: the browser checks the certificate itself.
+  const { FakeWT: W2, stats: s2 } = fakeWtFactory();
+  const c2 = new WtConnection("https://fake/", { WebTransport: W2 });
+  await c2.open();
+  assert.equal(s2.sessions[0].options.serverCertificateHashes, undefined);
+  c2.close();
+});
+
+test("WebTransport: POST respects the CONTINUE window and counts only bytes whose writes resolved", async () => {
+  const { FakeWT, stats } = fakeWtFactory({ window: 3, writeDelay: 3 });
+  const conn = new WtConnection("https://fake/", { WebTransport: FakeWT });
+  await conn.open();
+  const http = new HttpConnection(async () => conn, target);
+  let progress = 0;
+  let ahead = 0;
+  let lagged = false;
+  const size = 1_000_000;
+  const r = await http.request({
+    method: "POST",
+    path: "/r/0-999999",
+    bodySize: size,
+    onProgress: (n) => {
+      progress += n;
+      // Before the 200 (which reports the rest, like XHR's onload) nothing is counted that the
+      // fake has not taken in a resolved write.
+      if (progress < size && progress > stats.resolvedData) ahead++;
+      if (conn.bufferedAmount > 0) lagged = true;
+    },
+  });
+  assert.equal(r.ok, true);
+  assert.equal(stats.uploaded, size);
+  assert.equal(progress, size);
+  assert.equal(ahead, 0, "progress never ran ahead of resolved writes");
+  assert.ok(lagged, "the count waited for writes to resolve");
+  assert.equal(stats.violations, 0, "never sent past the window");
+  const p = await http.request({ method: "POST", path: "/r/0-0", bodySize: 0 });
+  assert.equal(p.ok, true);
+  await new Promise((res) => setTimeout(res, 10));  // the fake answers before its writes resolve
+  assert.equal(conn.bufferedAmount, 0);
+  conn.close();
+});
+
+test("WebTransport: Connection: close reconnects on a new stream; a lost session fails the request", async () => {
+  const { FakeWT, stats } = fakeWtFactory({ window: 8, closeEvery: 1 });
+  const conn = new WtConnection("https://fake/", { WebTransport: FakeWT });
+  await conn.open();
+  const http = new HttpConnection(async () => conn, target);
+  for (let i = 0; i < 3; i++) assert.equal((await http.request({ method: "GET", path: "/r/0-2499" })).bytes, 2500);
+  assert.equal(stats.connects, 3);
+  let closing = false;
+  const onProgress = () => {
+    if (!closing) {
+      closing = true;
+      conn.wt.drop();
+    }
+  };
+  let closed = false;
+  conn.onclose = () => (closed = true);
+  await assert.rejects(http.request({ method: "GET", path: "/r/0-1999999", onProgress }), /closed/);
+  await new Promise((r) => setTimeout(r, 5));
+  assert.ok(conn.closed && closed);
+});
+
+test("WebTransport: open fails on a refused session, a timeout, a missing constructor", async () => {
+  const { FakeWT } = fakeWtFactory({ mode: "refuse" });
+  await assert.rejects(new WtConnection("https://fake/", { WebTransport: FakeWT }).open(), /refused/);
+  const { FakeWT: Hang } = fakeWtFactory({ mode: "hang" });
+  const h = new WtConnection("https://fake/", { WebTransport: Hang });
+  await assert.rejects(h.open(30), /timed out/);
+  assert.ok(h.closed);
+  await assert.rejects(new WtConnection("https://fake/", { WebTransport: undefined }).open(), /no WebTransport/);
+  // close() while opening rejects the open at once.
+  const { FakeWT: Hang2 } = fakeWtFactory({ mode: "hang" });
+  const c = new WtConnection("https://fake/", { WebTransport: Hang2 });
+  const opening = c.open(10000);
+  c.close();
+  await assert.rejects(opening, /closed/);
+});
+
+test("WebTransport: a length prefix past any Wisp packet breaks the session", async () => {
+  const { FakeWT } = fakeWtFactory();
+  const conn = new WtConnection("https://fake/", { WebTransport: FakeWT });
+  await conn.open();
+  conn._feed(new Uint8Array([0xff, 0xff, 0xff, 0x7f, 1, 2]));
+  assert.ok(conn.closed);
+});
+
+test("webtransportConfig / webtransportConfigUrl", () => {
+  assert.equal(webtransportConfigUrl("wss://wisp.baby/"), "https://wisp.baby/webtransport.json");
+  assert.equal(webtransportConfigUrl("ws://127.0.0.1:6011/x/"), "http://127.0.0.1:6011/webtransport.json");
+  assert.equal(webtransportConfigUrl("https://wisp.baby/"), null);
+  assert.equal(webtransportConfigUrl("nope"), null);
+  assert.deepEqual(webtransportConfig({ url: "https://holywisp.fracit.al/", hashes: [] }, "wss://wisp.baby/"), {
+    url: "https://holywisp.fracit.al/",
+    hashes: [],
+  });
+  // "" is holyWisp's default: the relay's own host and port.
+  assert.deepEqual(webtransportConfig({ url: "", hashes: [HASH, { algorithm: "md5", value: "x" }, null] }, "ws://127.0.0.1:6011/"), {
+    url: "https://127.0.0.1:6011/",
+    hashes: [HASH],
+  });
+  assert.equal(webtransportConfig({ url: "http://x/", hashes: [] }, "wss://wisp.baby/"), null);
+  assert.equal(webtransportConfig({ url: "https://x/" }, "wss://wisp.baby/"), null);
+  assert.equal(webtransportConfig(null, "wss://wisp.baby/"), null);
+  assert.equal(webtransportConfig("<html>", "wss://wisp.baby/"), null);
+});
+
+// The engine's choice of transport: watch the `transport` event, then stop (the fake server does
+// not serve the speed test's paths).
+function chooseWith({ transport, wt, WebTransport, webtransport = { url: "https://fake-wt/", hashes: [] } }) {
+  const { FakeWS } = fakeWispFactory({ window: 8 });
+  let wsMade = 0;
+  class CountingWS extends FakeWS {
+    constructor(...a) {
+      super(...a);
+      wsMade++;
+    }
+  }
+  const st = createSpeedtest({
+    mode: "gcore",
+    wispUrl: "ws://fake/",
+    where: { addr: "198.51.100.9", host: "test" },
+    connections: { min: 1, max: 3 },
+    transport,
+    webtransport,
+    WebSocket: CountingWS,
+    WebTransport: WebTransport !== undefined ? WebTransport : wt && wt.FakeWT,
+  });
+  const events = [];
+  for (const name of ["phase", "transport", "error"]) st.on(name, (d) => events.push({ name, d }));
+  return new Promise((resolve) => {
+    st.on("transport", (d) => {
+      st.stop();
+      resolve({ via: d, events, wsMade: () => wsMade });
+    });
+    st.on("error", (d) => resolve({ error: d, events, wsMade: () => wsMade }));
+    st.start();
+  });
+}
+
+test("engine: auto uses WebTransport when the listener answers", async () => {
+  const wt = fakeWtFactory();
+  const r = await chooseWith({ transport: undefined, wt, webtransport: { url: "https://fake-wt/", hashes: [HASH] } });
+  assert.deepEqual(r.via, { transport: "webtransport", url: "https://fake-wt/", fallback: null });
+  assert.equal(wt.stats.sessions.length, 1, "one session opened before the transport is reported");
+  assert.equal(wt.stats.sessions[0].options.serverCertificateHashes.length, 1);
+  assert.equal(r.wsMade(), 0);
+  await new Promise((res) => setTimeout(res, 10));
+  assert.equal(r.events.filter((e) => e.name !== "transport" && e.name !== "phase").length, 0);
+  assert.deepEqual(r.events.filter((e) => e.name === "phase").map((e) => e.d.phase), ["servers"], "nothing after stop()");
+});
+
+test("engine: auto falls back to WebSocket when WebTransport fails, is missing or not offered", async () => {
+  const refused = await chooseWith({ transport: "auto", wt: fakeWtFactory({ mode: "refuse" }) });
+  assert.equal(refused.via.transport, "websocket");
+  assert.equal(refused.via.url, "ws://fake/");
+  assert.match(refused.via.fallback, /refused/);
+  const missing = await chooseWith({ transport: "auto", WebTransport: null });
+  assert.deepEqual(missing.via, { transport: "websocket", url: "ws://fake/", fallback: null });
+  const wt = fakeWtFactory();
+  const none = await chooseWith({ transport: "auto", wt, webtransport: { not: "a description" } });
+  assert.deepEqual(none.via, { transport: "websocket", url: "ws://fake/", fallback: null });
+  assert.equal(wt.stats.sessions.length, 0);
+});
+
+test("engine: transport websocket never opens WebTransport; webtransport never falls back", async () => {
+  const wt = fakeWtFactory();
+  const ws = await chooseWith({ transport: "websocket", wt });
+  assert.equal(ws.via.transport, "websocket");
+  assert.equal(wt.stats.sessions.length, 0);
+  const forced = await chooseWith({ transport: "webtransport", wt: fakeWtFactory({ mode: "refuse" }) });
+  assert.equal(forced.error.phase, "servers");
+  assert.match(forced.error.message, /WebTransport to https:\/\/fake-wt\/: .*refused/);
+  assert.equal(forced.wsMade(), 0);
+  const forcedNone = await chooseWith({ transport: "webtransport", WebTransport: null });
+  assert.match(forcedNone.error.message, /no WebTransport/);
+  assert.throws(() => createSpeedtest({ mode: "gcore", wispUrl: "ws://x/", transport: "quic" }), /unknown transport/);
+});
+
+test("WispPool over WebTransport: adopt, warm, exclusive leases", async () => {
+  const { FakeWT, stats } = fakeWtFactory();
+  const connect = () => new WtConnection("https://fake/", { WebTransport: FakeWT });
+  const first = connect();
+  await first.open();
+  const pool = new WispPool("https://fake/", { connect });
+  pool.adopt(first);
+  pool.warm(3);
+  assert.equal(stats.sessions.length, 3, "warm opens the rest");
+  const leases = await Promise.all([pool.acquire(), pool.acquire(), pool.acquire()]);
+  assert.equal(new Set(leases).size, 3);
+  assert.ok(leases.includes(first));
+  assert.ok(leases.every((c) => c instanceof WtConnection && c.ready));
+  pool.close();
+  assert.ok(leases.every((c) => c.closed));
 });

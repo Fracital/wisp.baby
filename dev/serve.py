@@ -8,7 +8,10 @@ wisp.baby local dev harness (README.md). Python 3 stdlib only.
 
 http://127.0.0.1:8080  the page (site/), GET /where (dev JSON), the same
                        security headers as the boxes, with a CSP that also lets the page reach
-                       ws://127.0.0.1:* (the dev holyWisp). GET /live, /live/history and /you
+                       the dev holyWisp on 127.0.0.1 / localhost: ws:// (the relay), http://
+                       (its /webtransport.json, which the page reads from the ?wisp= relay's
+                       origin) and https:// (its WebTransport listener, when it has one).
+                       GET /live, /live/history and /you
                        answer with made-up but moving numbers for five fake boxes (README.md
                        "Live stats"); the dev speed test's own bytes show up in them.
                        --no-live makes them 503, like a box whose stats are down;
@@ -42,7 +45,8 @@ SITE = os.path.normpath(os.path.join(HERE, "..", "site"))
 
 CSP = ("default-src 'none'; script-src 'self' blob: 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; "
        "img-src 'self' data: blob:; font-src 'self'; "
-       "connect-src 'self' ws://127.0.0.1:* ws://localhost:* wss://wisp.baby wss://*.wisp.baby "
+       "connect-src 'self' ws://127.0.0.1:* ws://localhost:* http://127.0.0.1:* http://localhost:* "
+       "https://127.0.0.1:* https://localhost:* wss://wisp.baby wss://*.wisp.baby "
        "https://cdn.jsdelivr.net blob:; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; "
        "form-action 'none'; frame-ancestors 'none'")
 

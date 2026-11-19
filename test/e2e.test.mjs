@@ -1,6 +1,8 @@
 // End-to-end: the engine in Node (global WebSocket) → a real holyWisp → a local /speedtest/range
 // server. Skipped unless HOLYWISP_BIN points at a holyWisp binary (npm holywisp@0.5.2,
-// bin/linux-x64/holywisp, checked against its npm integrity first).
+// bin/linux-x64/holywisp, checked against its npm integrity first, or a local build). Node has no
+// WebTransport, so this runs over WebSocket; test/browser.test.mjs runs the page in headless Chrome
+// over WebTransport.
 //
 //   HOLYWISP_BIN=/path/to/holywisp node --test test/e2e.test.mjs
 //
@@ -12,26 +14,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import net from "node:net";
-import { spawn } from "node:child_process";
 import { randomFillSync } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createSpeedtest } from "../site/speedtest.js";
+import { freePort, startHolyWisp } from "./holywisp.mjs";
 
 const BIN = process.env.HOLYWISP_BIN;
 const [DMIN, DMAX] = (process.env.E2E_DURATION || "5,10").split(",").map(Number);
 const CAP = 26214400;
-
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const s = net.createServer();
-    s.listen(0, "127.0.0.1", () => {
-      const { port } = s.address();
-      s.close(() => resolve(port));
-    });
-    s.on("error", reject);
-  });
-}
 
 /** The box's :80 contract: GET /speedtest/range/A-B → B-A+1 bytes (capped), POST → discard, 200. */
 function startRangeServer() {
@@ -77,34 +67,9 @@ function startRangeServer() {
   return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve({ server, stats, port: server.address().port })));
 }
 
-async function startHolyWisp(port) {
-  const args = [
-    "--host", "127.0.0.1", "--port", String(port), "--log-level", "warn",
-    "--allow-tcp", "on", "--allow-udp", "off",
-    "--allow-direct-ip", "on", "--allow-private", "on", "--allow-loopback", "on",
-    "--enable-v2", "on", "--password-required", "off",
-    "--buffer-remaining", "128", "--max-message-size", "262149", "--stream-queue-max", "67108864",
-    "--flood-protection", "off", "--reputation", "off", "--serve-webclient", "off",
-    "--tcp-nodelay", "on", "--stop-on-stdin-eof", "on",
-  ];
-  const proc = spawn(BIN, args, { stdio: ["pipe", "inherit", "inherit"] });
-  for (let i = 0; i < 100; i++) {
-    if (proc.exitCode !== null) throw new Error(`holyWisp exited ${proc.exitCode}`);
-    try {
-      const r = await fetch(`http://127.0.0.1:${port}/health`);
-      if (r.ok) return proc;
-    } catch {
-      /* not up yet */
-    }
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  proc.kill();
-  throw new Error("holyWisp did not come up");
-}
-
 function record(t) {
   const events = [];
-  for (const name of ["phase", "servers", "download", "latency", "upload", "error"]) {
+  for (const name of ["phase", "servers", "transport", "download", "latency", "upload", "error"]) {
     t.on(name, (d) => events.push({ name, d, at: performance.now() }));
   }
   return events;
@@ -115,7 +80,7 @@ const mbps = (bps) => (bps / 1e6).toFixed(1);
 test("e2e against holyWisp", { skip: !BIN && "set HOLYWISP_BIN", timeout: 300000 }, async (t) => {
   const range = await startRangeServer();
   const wispPort = await freePort();
-  const hw = await startHolyWisp(wispPort);
+  const hw = await startHolyWisp(BIN, wispPort);
   const wispUrl = `ws://127.0.0.1:${wispPort}/`;
   const where = { site: "dev", host: "localhost", city: "Here", country: "XX", addr: "127.0.0.1", speedPort: range.port };
   t.after(() => {
@@ -145,6 +110,11 @@ test("e2e against holyWisp", { skip: !BIN && "set HOLYWISP_BIN", timeout: 300000
     );
     const servers = events.find((e) => e.name === "servers").d;
     assert.deepEqual(servers.targets, [{ label: "localhost", addr: "127.0.0.1" }]);
+    // Node has no WebTransport: auto runs over WebSocket, and says so once, before the download.
+    const via = events.filter((e) => e.name === "transport");
+    assert.deepEqual(via.map((e) => e.d), [{ transport: "websocket", url: wispUrl, fallback: null }]);
+    assert.ok(via[0].at <= events.find((e) => e.name === "download").at);
+    assert.deepEqual(result.transport, via[0].d);
     assert.equal(servers.wisp.addr, "127.0.0.1");
     // Each kind: progress events, then exactly one final, last.
     for (const kind of ["download", "latency", "upload"]) {

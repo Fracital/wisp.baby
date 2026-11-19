@@ -1,7 +1,8 @@
 // wisp.baby speed-test engine. ES module, no dependencies.
 //
 // Three layers, bottom up:
-//   1. A small Wisp v1 client (one WebSocket, many TCP streams, the CONTINUE send window).
+//   1. A small Wisp v1 client (one WebSocket or one WebTransport session, many TCP streams, the
+//      CONTINUE send window).
 //   2. A minimal HTTP/1.1 client on one Wisp stream (keep-alive, Content-Length, chunked,
 //      close-delimited bodies; byte-level progress; time to first response byte).
 //   3. fast.com's measuring algorithm, ported from its tester (README "The fast.com algorithm"):
@@ -11,7 +12,8 @@
 // The contract (options, events, server endpoints) is README.md.
 //
 //   import { createSpeedtest } from "./speedtest.js";
-//   const t = createSpeedtest({ mode, wispUrl, where, connections, duration, libcurlBase });
+//   const t = createSpeedtest({ mode, wispUrl, where, connections, duration, libcurlBase,
+//                               transport, webtransport });
 //   t.on("download", (e) => ...); t.start(); t.stop();
 
 // ============================================================================ constants
@@ -33,10 +35,21 @@ const UNLOADED_MIN_SAMPLES = 50;         // ... with > 50 samples
 // may sit at the relay ahead of the remote. At 128 KiB that is 16 MiB per stream, and the upload
 // then moves in multi-MB bursts several seconds apart whenever the relay → server leg is the slow
 // one, which starves the snapshots (every worker must have new bytes). 32 KiB keeps it to 4 MiB
-// with ~1 MiB refills. The cap on ws.bufferedAmount keeps the browser from queueing the whole body.
+// with ~1 MiB refills. The cap on the connection's bufferedAmount (the WebSocket's, or the bytes
+// whose WebTransport write has not resolved) keeps the browser from queueing the whole body.
 export const MAX_DATA_PAYLOAD = 262144;
 const UPLOAD_CHUNK = 32768;
 const MAX_BUFFERED = 4 * 1024 * 1024;
+
+// WebTransport: how long `auto` waits for the session and its stream-0 CONTINUE before it runs the
+// test over WebSocket instead (a network that drops UDP never answers; on one that carries it the
+// QUIC handshake is one round trip). An explicit `transport: "webtransport"` waits as long as a
+// WebSocket handshake. A Wisp packet on the session's stream is at most this long (holyWisp sends
+// at most 128 KiB of payload per packet); a longer length prefix is a broken stream.
+export const TRANSPORTS = ["auto", "webtransport", "websocket"];
+const WT_AUTO_TIMEOUT_MS = 3000;
+const HANDSHAKE_TIMEOUT_MS = 10000;
+const WT_MAX_PACKET = 16 * 1024 * 1024;
 
 const API_FAST_COM =
   "https://api.fast.com/netflix/speedtest/v2?https=false&token=YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm&urlCount=5";
@@ -397,55 +410,21 @@ class WispStream {
 }
 
 /**
- * One WebSocket to a Wisp v1 server. No subprotocol: on holyWisp that selects v1, and the server
- * opens with a CONTINUE on stream 0 carrying every new stream's initial send window (packets).
+ * What both transports share: the streams, the stream-0 CONTINUE that makes the connection ready
+ * (every new stream's initial send window, in packets), and the packet dispatch. A subclass opens
+ * the transport, calls _packet() with each Wisp packet it receives, sends with _send(), and reports
+ * the bytes it has been given but the browser has not yet taken in `bufferedAmount`.
  */
-export class WispConnection {
-  constructor(url, { WebSocket: WS = globalThis.WebSocket } = {}) {
+class WispSession {
+  constructor(url) {
     this.url = url;
-    this.WS = WS;
-    this.ws = null;
     this.streams = new Map();
     this.nextId = 1;
     this.initialWindow = 0;
     this.ready = false;
     this.closed = false;
     this.onclose = null;
-  }
-
-  open(timeoutMs = 10000) {
-    return new Promise((resolve, reject) => {
-      let ws;
-      try {
-        ws = new this.WS(this.url);
-      } catch (e) {
-        this.closed = true;
-        reject(e);
-        return;
-      }
-      this.ws = ws;
-      ws.binaryType = "arraybuffer";
-      const timer = setTimeout(() => {
-        reject(new Error("Wisp handshake timed out"));
-        this.close();
-      }, timeoutMs);
-      this._ready = () => {
-        clearTimeout(timer);
-        resolve(this);
-      };
-      ws.onmessage = (ev) => this._message(ev);
-      ws.onerror = () => {};  // a close event follows
-      ws.onclose = (ev) => {
-        clearTimeout(timer);
-        const wasReady = this.ready;
-        this._closed();
-        if (!wasReady) reject(new Error(`Wisp WebSocket closed (${ev && ev.code})`));
-      };
-    });
-  }
-
-  get bufferedAmount() {
-    return this.ws ? this.ws.bufferedAmount : 0;
+    this._ready = null;
   }
 
   createStream(hostname, port) {
@@ -457,25 +436,11 @@ export class WispConnection {
     return stream;
   }
 
-  close() {
-    if (this.closed) return;
-    try {
-      this.ws && this.ws.close();
-    } catch {
-      /* already closing */
-    }
-    this._closed();
-  }
-
-  _send(bytes) {
-    this.ws.send(bytes);
-  }
-
-  _message(ev) {
-    if (typeof ev.data === "string") return;
+  /** One whole Wisp packet (an ArrayBuffer, or a Uint8Array view of exactly one). */
+  _packet(data) {
     let pkt;
     try {
-      pkt = decodePacket(ev.data);
+      pkt = decodePacket(data);
     } catch {
       return;
     }
@@ -487,7 +452,7 @@ export class WispConnection {
           this._ready();
         }
       }
-      return;  // a CLOSE on stream 0 is followed by the socket closing
+      return;  // a CLOSE on stream 0 is followed by the transport closing
     }
     const stream = this.streams.get(pkt.streamId);
     if (!stream) return;
@@ -516,26 +481,309 @@ export class WispConnection {
 }
 
 /**
- * The run's WebSockets. Each worker leases one exclusively (one WebSocket per worker, as many
- * browser ⇄ box TCP flows as fast.com has to its OCAs) and gives it back when it stops, so the
- * next phase reuses it. warm(n) opens n up front, before any load.
+ * One WebSocket to a Wisp v1 server. No subprotocol: on holyWisp that selects v1, and the server
+ * opens with a CONTINUE on stream 0 carrying every new stream's initial send window (packets).
+ */
+export class WispConnection extends WispSession {
+  constructor(url, { WebSocket: WS = globalThis.WebSocket } = {}) {
+    super(url);
+    this.transport = "websocket";
+    this.WS = WS;
+    this.ws = null;
+  }
+
+  open(timeoutMs = HANDSHAKE_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+      let ws;
+      try {
+        ws = new this.WS(this.url);
+      } catch (e) {
+        this.closed = true;
+        reject(e);
+        return;
+      }
+      this.ws = ws;
+      ws.binaryType = "arraybuffer";
+      const timer = setTimeout(() => {
+        reject(new Error("Wisp handshake timed out"));
+        this.close();
+      }, timeoutMs);
+      this._ready = () => {
+        clearTimeout(timer);
+        resolve(this);
+      };
+      ws.onmessage = (ev) => {
+        if (typeof ev.data !== "string") this._packet(ev.data);
+      };
+      ws.onerror = () => {};  // a close event follows
+      ws.onclose = (ev) => {
+        clearTimeout(timer);
+        const wasReady = this.ready;
+        this._closed();
+        if (!wasReady) reject(new Error(`Wisp WebSocket closed (${ev && ev.code})`));
+      };
+    });
+  }
+
+  get bufferedAmount() {
+    return this.ws ? this.ws.bufferedAmount : 0;
+  }
+
+  close() {
+    if (this.closed) return;
+    try {
+      this.ws && this.ws.close();
+    } catch {
+      /* already closing */
+    }
+    this._closed();
+  }
+
+  _send(bytes) {
+    this.ws.send(bytes);
+  }
+}
+
+function base64Bytes(b64) {
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
+/**
+ * One WebTransport session to holyWisp's WebTransport listener (Wisp over HTTP/3, on QUIC), the
+ * same Wisp v1 as on a WebSocket: no `protocols` (that would select v2), one bidirectional stream
+ * (the Wisp stream) carrying Wisp packets back to back, each behind its length as a u32 LE, and the
+ * server's stream-0 CONTINUE first. Datagrams carry only UDP stream DATA, which a speed test never
+ * opens, so they are not read.
+ *
+ * `hashes` are /webtransport.json's (`[{algorithm: "sha-256", value: <base64>}]`), passed as
+ * serverCertificateHashes for a self-signed listener; with none the browser checks the certificate
+ * like any https site's.
+ *
+ * bufferedAmount is the payload of every write() whose promise has not resolved yet. A write
+ * resolves once the browser has taken the bytes out of the stream's queue into its network stack
+ * (Chrome: written into the data pipe to the network service, the same hand-off at which a
+ * WebSocket's bufferedAmount stops counting them), so "sent minus bufferedAmount" means what it
+ * means on a WebSocket. It is counted here, not read from writer.desiredSize, because the queue's
+ * high-water mark is the browser's choice (and counts chunks, not bytes, in some).
+ */
+export class WtConnection extends WispSession {
+  constructor(url, { WebTransport: WT = globalThis.WebTransport, hashes = [] } = {}) {
+    super(url);
+    this.transport = "webtransport";
+    this.WT = WT;
+    this.hashes = hashes;
+    this.wt = null;
+    this.writer = null;
+    this._buffered = 0;
+    this._fail = null;
+    this._hold = null;  // a packet that straddles reads: its bytes so far (length prefix included)
+    this._held = 0;
+  }
+
+  open(timeoutMs = HANDSHAKE_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+      if (typeof this.WT !== "function") {
+        this.closed = true;
+        reject(new Error("this browser has no WebTransport"));
+        return;
+      }
+      const opts = {};
+      if (this.hashes.length) {
+        opts.serverCertificateHashes = this.hashes.map((h) => ({ algorithm: h.algorithm, value: base64Bytes(h.value) }));
+      }
+      let wt;
+      try {
+        wt = new this.WT(this.url, opts);
+      } catch (e) {
+        this.closed = true;
+        reject(e);
+        return;
+      }
+      this.wt = wt;
+      let timer = null;
+      const fail = (err) => {
+        clearTimeout(timer);
+        this._fail = null;
+        const wasReady = this.ready;
+        this.close();
+        if (!wasReady) reject(err);
+      };
+      this._fail = fail;
+      timer = setTimeout(() => fail(new Error("WebTransport handshake timed out")), timeoutMs);
+      this._ready = () => {
+        clearTimeout(timer);
+        resolve(this);
+      };
+      Promise.resolve(wt.closed).then(
+        () => fail(new Error("WebTransport session closed")),
+        (e) => fail(new Error((e && e.message) || "WebTransport failed")),
+      );
+      (async () => {
+        await wt.ready;
+        const bidi = await wt.createBidirectionalStream();
+        if (this.closed) return;
+        this.writer = bidi.writable.getWriter();
+        const reader = bidi.readable.getReader();
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done || this.closed) break;
+          this._feed(value instanceof Uint8Array ? value : new Uint8Array(value));
+        }
+        if (!this.closed) fail(new Error("the Wisp stream ended"));
+      })().catch((e) => fail(e instanceof Error ? e : new Error(String(e))));
+    });
+  }
+
+  get bufferedAmount() {
+    return this._buffered;
+  }
+
+  close() {
+    if (this.closed) return;
+    this._closed();
+    if (this._fail) this._fail(new Error("closed"));  // an open() still waiting rejects now
+    try {
+      if (this.wt) this.wt.close({ closeCode: 0, reason: "" });
+    } catch {
+      /* already closed */
+    }
+  }
+
+  _send(bytes) {
+    const frame = new Uint8Array(4 + bytes.length);
+    new DataView(frame.buffer).setUint32(0, bytes.length, true);
+    frame.set(bytes, 4);
+    const n = bytes.length;
+    this._buffered += n;
+    this.writer.write(frame).then(
+      () => {
+        this._buffered -= n;
+      },
+      () => {
+        this._buffered -= n;
+        this.close();
+      },
+    );
+  }
+
+  /** Split what the Wisp stream delivered into packets. Whole packets are handed on as views of
+   *  the read; one that straddles reads is gathered in a buffer of its own. */
+  _feed(u8) {
+    let i = 0;
+    const n = u8.length;
+    if (this._hold) {
+      if (this._held < 4) {
+        const take = Math.min(4 - this._held, n);
+        this._hold.set(u8.subarray(0, take), this._held);
+        this._held += take;
+        i = take;
+        if (this._held < 4) return;
+        const len = new DataView(this._hold.buffer).getUint32(0, true);
+        if (len > WT_MAX_PACKET) return this._broken();
+        const full = new Uint8Array(4 + len);
+        full.set(this._hold.subarray(0, 4));
+        this._hold = full;
+      }
+      const take = Math.min(this._hold.length - this._held, n - i);
+      this._hold.set(u8.subarray(i, i + take), this._held);
+      this._held += take;
+      i += take;
+      if (this._held < this._hold.length) return;
+      const pkt = this._hold.subarray(4);
+      this._hold = null;
+      this._held = 0;
+      this._packet(pkt);
+      if (this.closed) return;
+    }
+    const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    while (n - i >= 4) {
+      const len = view.getUint32(i, true);
+      if (len > WT_MAX_PACKET) return this._broken();
+      if (n - i - 4 < len) break;
+      this._packet(u8.subarray(i + 4, i + 4 + len));
+      if (this.closed) return;
+      i += 4 + len;
+    }
+    if (i < n) {
+      const rest = n - i;
+      let size = 4;
+      if (rest >= 4) size = 4 + view.getUint32(i, true);
+      this._hold = new Uint8Array(size);
+      this._hold.set(u8.subarray(i));
+      this._held = rest;
+    }
+  }
+
+  _broken() {
+    this._hold = null;
+    this._held = 0;
+    if (this._fail) this._fail(new Error("broken Wisp stream (packet length)"));
+    else this.close();
+  }
+}
+
+/**
+ * Which transport a run may use, from /webtransport.json as the relay serves it
+ * (`{url, hashes: [{algorithm, value}]}`), or null if it offers none. An empty url is holyWisp's
+ * default: the relay's own host and port, over https. Only https:// URLs and sha-256 hashes.
+ */
+export function webtransportConfig(json, wispUrl) {
+  if (!json || typeof json !== "object" || typeof json.url !== "string" || !Array.isArray(json.hashes)) return null;
+  let url = json.url;
+  if (url === "") {
+    let u;
+    try {
+      u = new URL(wispUrl);
+    } catch {
+      return null;
+    }
+    if (u.protocol !== "ws:" && u.protocol !== "wss:") return null;
+    url = `https://${u.host}/`;
+  }
+  if (!/^https:\/\/[^/]/i.test(url)) return null;
+  const hashes = json.hashes
+    .filter((h) => h && h.algorithm === "sha-256" && typeof h.value === "string" && /^[A-Za-z0-9+/]{43}=$/.test(h.value))
+    .map((h) => ({ algorithm: h.algorithm, value: h.value }));
+  return { url, hashes };
+}
+
+/** Where a relay describes its WebTransport listener: /webtransport.json at the root of the origin
+ *  that serves its WebSocket (ws://h/... → http://h/webtransport.json), or null. */
+export function webtransportConfigUrl(wispUrl) {
+  let u;
+  try {
+    u = new URL(wispUrl);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "ws:" && u.protocol !== "wss:") return null;
+  return `${u.protocol === "wss:" ? "https:" : "http:"}//${u.host}/webtransport.json`;
+}
+
+/**
+ * The run's connections (WebSockets, or WebTransport sessions: one each way, never mixed). Each
+ * worker leases one exclusively (one connection per worker, as many browser ⇄ box flows as fast.com
+ * has to its OCAs) and gives it back when it stops, so the next phase reuses it. warm(n) opens n up
+ * front, before any load.
  *
  * Why: Chrome holds a new WebSocket's handshake to an endpoint for seconds (5–15 s measured, the
  * relay answering in 1–2 ms) while other sockets to it are saturated with uploads. Opening a socket
  * per ramp worker under load left those workers idle (no snapshots), and the 10 s handshake
  * timeout then restarted the attempt, resetting testTime, over and over.
+ *
+ * `connect` makes a new, unopened connection (default: a WispConnection to `url`).
  */
 export class WispPool {
-  constructor(url, { WebSocket: WS = globalThis.WebSocket } = {}) {
+  constructor(url, { WebSocket: WS = globalThis.WebSocket, connect = null } = {}) {
     this.url = url;
-    this.WS = WS;
+    this.connect = connect || (() => new WispConnection(url, { WebSocket: WS }));
     this.idle = [];        // {conn, opened: Promise<conn>}, open or still opening
     this.all = new Set();  // every live connection, leased or idle
     this.closed = false;
   }
 
   _open() {
-    const conn = new WispConnection(this.url, { WebSocket: this.WS });
+    const conn = this.connect();
     this.all.add(conn);
     const opened = conn.open().then(
       () => conn,
@@ -547,6 +795,16 @@ export class WispPool {
     );
     opened.catch(() => {});  // an idle entry may fail before anyone waits on it
     return { conn, opened };
+  }
+
+  /** Take an already open connection in as an idle one. */
+  adopt(conn) {
+    if (this.closed) {
+      conn.close();
+      return;
+    }
+    this.all.add(conn);
+    this.idle.push({ conn, opened: Promise.resolve(conn) });
   }
 
   _prune() {
@@ -811,8 +1069,8 @@ export class HttpResponseParser {
  * request() resolves {ok, status, headers, start, firstByte, end, bytes}: `start` is when the
  * request was handed to the socket and `firstByte` when the first response byte arrived (their
  * difference is the latency sample). It rejects on network failure or timeout.
- * onProgress(n) reports body bytes as they arrive (GET) or as they leave the WebSocket (POST:
- * bytes handed to ws.send minus ws.bufferedAmount).
+ * onProgress(n) reports body bytes as they arrive (GET) or as they leave the connection (POST:
+ * bytes handed to it minus its bufferedAmount; WtConnection says what that is on WebTransport).
  */
 export class HttpConnection {
   constructor(getConn, target, now = () => performance.now()) {
@@ -881,7 +1139,7 @@ export class HttpConnection {
     });
   }
 
-  /** Report upload bytes that have left the WebSocket since the last call. */
+  /** Report upload bytes that have left the connection (WebSocket or WebTransport) since the last call. */
   pollUpload() {
     const req = this.req;
     if (!req || !req.upload || !this.conn) return;
@@ -1199,8 +1457,8 @@ class Worker {
     this.ping = new HttpConnection(getConn, target, ctx.now);  // the pinger
   }
 
-  /** The worker's own WebSocket, leased from the run's pool (again if it closed); the data and
-   *  ping streams share it. */
+  /** The worker's own connection (WebSocket or WebTransport session), leased from the run's pool
+   *  (again if it closed); the data and ping streams share it. */
   getConn() {
     if (this.closed) return Promise.reject(new Error("stopped"));
     if (this.conn && !this.conn.closed) return Promise.resolve(this.conn);
@@ -1521,13 +1779,15 @@ function clampInt(v, lo, hi, dflt) {
 
 /**
  * Create a speed test. See README "Engine". Extra options, for tests and harnesses:
- * `WebSocket` (constructor), `now` (ms clock), `fetch` (for libcurl's files), `libcurl` (an already
- * loaded libcurl object), `speedPort` (overrides where.speedPort).
+ * `WebSocket` and `WebTransport` (constructors), `now` (ms clock), `fetch` (for libcurl's files),
+ * `libcurl` (an already loaded libcurl object), `speedPort` (overrides where.speedPort).
  */
 export function createSpeedtest(options = {}) {
   const mode = options.mode;
   if (mode !== "gcore" && mode !== "netflix") throw new TypeError(`unknown mode: ${mode}`);
   if (!options.wispUrl) throw new TypeError("wispUrl is required");
+  const transport = options.transport ?? "auto";
+  if (!TRANSPORTS.includes(transport)) throw new TypeError(`unknown transport: ${transport}`);
   const where = options.where || {};
   const cmin = clampInt(options.connections?.min, 1, 30, 1);
   const cmax = Math.max(cmin, clampInt(options.connections?.max, 1, 30, 8));
@@ -1541,14 +1801,18 @@ export function createSpeedtest(options = {}) {
     duration: { min: dmin, max: dmax },
     libcurlBase: options.libcurlBase || LIBCURL_BASE,
     speedPort: clampInt(options.speedPort ?? where.speedPort, 1, 65535, 80),
+    transport,
+    webtransport: webtransportConfig(options.webtransport, options.wispUrl),
   };
   const ctx = {
     opts,
     wispUrl: opts.wispUrl,
     WebSocket: options.WebSocket || globalThis.WebSocket,
+    WebTransport: options.WebTransport || globalThis.WebTransport,
     now: options.now || (() => performance.now()),
+    pool: null,   // the run's connections, made once the transport is chosen
+    probe: null,  // the first WebTransport session while it opens
   };
-  ctx.pool = new WispPool(opts.wispUrl, { WebSocket: ctx.WebSocket });
 
   const listeners = new Map();
   let started = null;
@@ -1603,6 +1867,49 @@ export function createSpeedtest(options = {}) {
     return { targets: [target], refresh: null };
   }
 
+  /**
+   * Choose the run's transport and make its pool (README "Engine", `transport`). WebTransport needs
+   * the constructor and a listener (opts.webtransport); its first session is opened here, before
+   * any load, and proves the path: if it does not open, `auto` runs the whole test over WebSocket
+   * and says why in `fallback`, `webtransport` fails the run. The run never mixes the two.
+   */
+  async function chooseTransport() {
+    const ws = (fallback = null) => {
+      ctx.pool = new WispPool(opts.wispUrl, { WebSocket: ctx.WebSocket });
+      return { transport: "websocket", url: opts.wispUrl, fallback };
+    };
+    const wt = opts.webtransport;
+    const WT = typeof ctx.WebTransport === "function" ? ctx.WebTransport : null;
+    if (transport === "websocket") return ws();
+    if (!WT || !wt) {
+      if (transport === "webtransport") {
+        throw new Error(WT ? "the relay has no WebTransport listener" : "this browser has no WebTransport");
+      }
+      return ws();
+    }
+    const connect = () => new WtConnection(wt.url, { WebTransport: WT, hashes: wt.hashes });
+    const first = connect();
+    ctx.probe = first;
+    try {
+      await first.open(transport === "auto" ? WT_AUTO_TIMEOUT_MS : HANDSHAKE_TIMEOUT_MS);
+    } catch (e) {
+      first.close();
+      if (stopped) return null;
+      const why = (e && e.message) || String(e);
+      if (transport === "webtransport") throw new Error(`WebTransport to ${wt.url}: ${why}`);
+      return ws(why);
+    } finally {
+      ctx.probe = null;
+    }
+    if (stopped) {
+      first.close();
+      return null;
+    }
+    ctx.pool = new WispPool(wt.url, { connect });
+    ctx.pool.adopt(first);
+    return { transport: "webtransport", url: wt.url, fallback: null };
+  }
+
   function phaseTest(type, getter, onProgress) {
     if (stopped) return Promise.resolve(null);
     tester = runTester(ctx, type, getter, onProgress);
@@ -1622,7 +1929,11 @@ export function createSpeedtest(options = {}) {
         targets: targets.map((t) => ({ label: t.label, addr: t.addr })),
       });
       const getter = new UrlGetter(targets, refresh, ctx.now);
-      // Every socket the run will use, opened now, before any load (WispPool says why). The
+      const via = await chooseTransport();
+      if (!via || stopped) return null;
+      emit("transport", via);
+      if (stopped) return null;
+      // Every connection the run will use, opened now, before any load (WispPool says why). The
       // latency test's min(5, max) workers fit in it too.
       ctx.pool.warm(opts.connections.max);
 
@@ -1658,7 +1969,7 @@ export function createSpeedtest(options = {}) {
       stopped = true;
       ctx.pool.close();
       emit("phase", { phase });
-      return { download, latency, upload };
+      return { download, latency, upload, transport: via };
     } catch (e) {
       if (stopped) return null;
       teardown();
@@ -1670,7 +1981,8 @@ export function createSpeedtest(options = {}) {
   function teardown() {
     stopped = true;
     if (tester) tester.cancel();
-    ctx.pool.close();
+    if (ctx.probe) ctx.probe.close();
+    if (ctx.pool) ctx.pool.close();
     abort.abort();
   }
 
@@ -1684,12 +1996,12 @@ export function createSpeedtest(options = {}) {
       listeners.get(name)?.delete(cb);
       return api;
     },
-    /** Starts the run; resolves {download, latency, upload} when done, null if stopped or failed. Never rejects. */
+    /** Starts the run; resolves {download, latency, upload, transport} when done, null if stopped or failed. Never rejects. */
     start() {
       if (!started) started = stopped ? Promise.resolve(null) : run();
       return started;
     },
-    /** Stops everything and closes every socket. No events follow. */
+    /** Stops everything and closes every connection. No events follow. */
     stop() {
       if (stopped) return;
       teardown();
